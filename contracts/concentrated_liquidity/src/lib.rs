@@ -232,6 +232,26 @@ pub struct Position {
     pub tokens_owed: (i128, i128),
 }
 
+/// Snapshot of the pool's protocol-fee configuration and accrued balances.
+///
+/// Returned by [`ConcentratedLiquidity::get_protocol_fee_info`].  All fields
+/// are zero / `None` when no protocol fee has been configured.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProtocolFeeInfo {
+    /// Protocol fee in basis points (0 – 9 999).  Zero until
+    /// `set_protocol_fee` is called.
+    pub bps: i128,
+    /// Address that receives fees on `withdraw_protocol_fees`.  `None` until
+    /// `set_protocol_fee` is called (the admin is used as the fallback
+    /// recipient, but that fallback is not reflected here).
+    pub recipient: Option<Address>,
+    /// Protocol fees accrued for token A since the last `withdraw_protocol_fees`.
+    pub accrued_a: i128,
+    /// Protocol fees accrued for token B since the last `withdraw_protocol_fees`.
+    pub accrued_b: i128,
+}
+
 /// Per-tick state stored in the tick registry (issue #178).
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -2154,6 +2174,56 @@ impl ConcentratedLiquidity {
             .instance()
             .get(&DataKey::FeeBps)
             .ok_or(ClError::NotInitialized)
+    }
+
+    /// Returns the pool's current protocol-fee configuration and accrued balances.
+    ///
+    /// Returns `ClError::NotInitialized` when the pool has not yet been
+    /// initialised, mirroring the behaviour of [`fee_bps`].
+    ///
+    /// All fields are zero / `None` before `set_protocol_fee` has ever been
+    /// called: `bps` is `0`, `recipient` is `None`, and both accrued amounts
+    /// are `0`.
+    ///
+    /// # Returns
+    /// A [`ProtocolFeeInfo`] containing:
+    /// - `bps` — protocol fee in basis points.
+    /// - `recipient` — the configured fee recipient (`None` if unset).
+    /// - `accrued_a` — fees owed in token A since the last withdrawal.
+    /// - `accrued_b` — fees owed in token B since the last withdrawal.
+    pub fn get_protocol_fee_info(env: Env) -> Result<ProtocolFeeInfo, ClError> {
+        Self::extend_instance_ttl(&env);
+        // Guard: return NotInitialized when the pool has never been set up.
+        // We use FeeBps as the canonical "has been initialized" sentinel,
+        // consistent with fee_bps() above.
+        if !env.storage().instance().has(&DataKey::FeeBps) {
+            return Err(ClError::NotInitialized);
+        }
+        let bps: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProtocolFeeBps)
+            .unwrap_or(0);
+        let recipient: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProtocolFeeRecipient);
+        let accrued_a: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccruedProtocolFeeA)
+            .unwrap_or(0);
+        let accrued_b: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccruedProtocolFeeB)
+            .unwrap_or(0);
+        Ok(ProtocolFeeInfo {
+            bps,
+            recipient,
+            accrued_a,
+            accrued_b,
+        })
     }
 
     // ── Issue #203: per-tick view functions ───────────────────────────────────

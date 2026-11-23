@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::{AggregatedPrice, ClError, ConcentratedLiquidity, ConcentratedLiquidityClient};
+use crate::{AggregatedPrice, ClError, ConcentratedLiquidity, ConcentratedLiquidityClient, ProtocolFeeInfo};
 use soroban_sdk::token::StellarAssetClient;
 use soroban_sdk::{
     contract, contractimpl, symbol_short, testutils::Address as _, testutils::Events as _,
@@ -369,4 +369,61 @@ fn test_upgrade_extends_instance_ttl() {
         .as_contract(&te.pool_addr, || te.env.storage().instance().get_ttl());
     assert!(ttl_after > ttl_before);
     assert!(ttl_after >= 3_110_400 - 1);
+}
+
+// ── get_protocol_fee_info tests (issue #357) ─────────────────────────────────
+
+/// Before the pool is initialised, `get_protocol_fee_info` must return
+/// `ClError::NotInitialized`, matching the behaviour of `fee_bps`.
+#[test]
+fn test_get_protocol_fee_info_not_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let pool_addr = env.register_contract(None, ConcentratedLiquidity);
+    let client = ConcentratedLiquidityClient::new(&env, &pool_addr);
+
+    assert_eq!(
+        client.try_get_protocol_fee_info(),
+        Err(Ok(ClError::NotInitialized))
+    );
+}
+
+/// Before `set_protocol_fee` is ever called the view must return all-zero
+/// defaults: `bps = 0`, `recipient = None`, both accrued amounts `0`.
+#[test]
+fn test_get_protocol_fee_info_defaults_before_set() {
+    let te = setup_test();
+
+    let info = te.client.get_protocol_fee_info();
+    assert_eq!(
+        info,
+        ProtocolFeeInfo {
+            bps: 0,
+            recipient: None,
+            accrued_a: 0,
+            accrued_b: 0,
+        }
+    );
+}
+
+/// After a swap with a non-zero protocol fee the view must reflect the
+/// accrued amounts, the configured bps, and the configured recipient.
+#[test]
+fn test_get_protocol_fee_info_accrues_after_swap() {
+    let te = setup_test();
+    let recipient = Address::generate(&te.env);
+    // 5 000 bps = 50 % of swap fees go to protocol
+    te.client.set_protocol_fee(&te.admin, &recipient, &5_000);
+
+    let trader = Address::generate(&te.env);
+    StellarAssetClient::new(&te.env, &te.token_a).mint(&trader, &1_000_000);
+    te.client
+        .swap(&trader, &true, &500_000, &0, &0, &u64::MAX);
+
+    let info = te.client.get_protocol_fee_info();
+    assert_eq!(info.bps, 5_000);
+    assert_eq!(info.recipient, Some(recipient));
+    // token_a was the input, so fees accrue in A; B stays at 0
+    assert!(info.accrued_a > 0, "expected accrued_a > 0, got {}", info.accrued_a);
+    assert_eq!(info.accrued_b, 0);
 }
