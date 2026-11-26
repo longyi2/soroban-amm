@@ -175,29 +175,34 @@ export class ConcentratedLiquidityClient {
     };
   }
 
+  /** Encode the arguments for the contract's quote_position entrypoint. */
+  quotePositionParams(
+    lowerTick: number, upperTick: number, liquidity: bigint,
+  ): xdr.ScVal[] {
+    return [i32(lowerTick), i32(upperTick), i128(liquidity)];
+  }
+
   /**
-   * Quotes how much token A and token B are required — and how much liquidity
-   * would be minted — for a position between `lowerTick` and `upperTick` given
-   * desired deposit amounts.
+   * Quotes the token A and token B amounts required for `liquidity` in a
+   * position between `lowerTick` and `upperTick`.
+   *
+   * Direction is liquidity → token amounts. The contract does not expose the
+   * reverse (amounts → liquidity) quote.
    */
   async quotePosition(
     lowerTick: number,
     upperTick: number,
-    amountA: bigint,
-    amountB: bigint
+    liquidity: bigint
   ): Promise<PositionQuote> {
     const raw = await this.simulate(
       "quote_position",
-      i32(lowerTick),
-      i32(upperTick),
-      i128(amountA),
-      i128(amountB)
+      ...this.quotePositionParams(lowerTick, upperTick, liquidity)
     );
-    const native = scValToNative(raw) as [unknown, unknown, unknown];
+    const native = scValToNative(raw) as [unknown, unknown];
     return {
       amountA: toBigInt(native[0]),
       amountB: toBigInt(native[1]),
-      liquidity: toBigInt(native[2]),
+      liquidity,
     };
   }
 

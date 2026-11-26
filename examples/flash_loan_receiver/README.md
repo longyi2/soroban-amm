@@ -221,10 +221,10 @@ Output: `target/wasm32v1-none/release/flash_loan_receiver.wasm`
 
 ### Step 2: Deploy the contract
 
-Using `soroban-cli`:
+Using `stellar-cli`:
 
 ```bash
-soroban contract deploy \
+stellar contract deploy \
   --wasm target/wasm32v1-none/release/flash_loan_receiver.wasm \
   --network testnet \
   --source <your-key>
@@ -236,8 +236,9 @@ This returns the contract address.
 
 Call the `initialize` entry point with the pool address and owner address:
 
+<!-- contract: flash_loan_receiver -->
 ```bash
-soroban contract invoke \
+stellar contract invoke \
   --id <receiver-address> \
   --network testnet \
   --source <your-key> \
@@ -253,7 +254,7 @@ soroban contract invoke \
 From another contract or off-chain via a transaction envelope:
 
 ```bash
-soroban contract invoke \
+stellar contract invoke \
   --id <pool-address> \
   --network testnet \
   --source <your-key> \

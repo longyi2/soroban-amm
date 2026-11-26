@@ -621,11 +621,9 @@ impl PolVestingContract {
         let mut i = offset;
         while i < end {
             let schedule_id = ids.get(i).unwrap();
-            if let Some(schedule) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, PolVesting>(&DataKey::Vesting(beneficiary.clone(), schedule_id))
-            {
+            let key = DataKey::Vesting(beneficiary.clone(), schedule_id);
+            if let Some(schedule) = env.storage().persistent().get::<DataKey, PolVesting>(&key) {
+                Self::bump_schedule(&env, &key, &schedule);
                 schedules.push_back(schedule);
             }
             i += 1;
@@ -1555,6 +1553,20 @@ mod tests {
         client.propose_treasury(&s.governance, &new_treasury);
 
         assert_eq!(client.get_pending_treasury(), Some(new_treasury));
+        assert_instance_ttl_bumped(&s);
+    }
+
+    #[test]
+    fn test_pending_views_restore_lapsed_instance_ttl() {
+        let s = setup();
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+
+        lower_instance_ttl_below_min(&s);
+        assert_eq!(client.get_pending_governance(), None);
+        assert_instance_ttl_bumped(&s);
+
+        lower_instance_ttl_below_min(&s);
+        assert_eq!(client.get_pending_treasury(), None);
         assert_instance_ttl_bumped(&s);
     }
 

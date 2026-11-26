@@ -81,16 +81,19 @@ export const resolvers = {
       },
       context?: GraphQLContext,
     ): AlertConfig | Promise<AlertConfig> => {
+      const indexer = activeIndexer(context);
       try {
-        const config = activeIndexer(context).setAlertConfig({
+        const config = indexer.validateAlertConfig({
           poolId,
           metric: metric as AlertMetric,
           thresholdBps,
           thresholdValue,
         });
+        // Durable first: a store failure must leave the in-memory indexer
+        // untouched, otherwise memory and the store diverge permanently.
         return context?.store
-          ? context.store.setAlertConfig(config).then(() => config)
-          : config;
+          ? context.store.setAlertConfig(config).then(() => indexer.applyAlertConfig(config))
+          : indexer.applyAlertConfig(config);
       } catch (error) {
         if (error instanceof InvalidMetricError || error instanceof InvalidThresholdError) {
           throw new GraphQLError(error.message, {
@@ -105,10 +108,12 @@ export const resolvers = {
       { poolId, metric }: { poolId: string; metric: string },
       context?: GraphQLContext,
     ): boolean | Promise<boolean> => {
-      const removed = activeIndexer(context).removeAlertConfig(poolId, metric);
-      return context?.store
-        ? context.store.removeAlertConfig(poolId, metric).then((stored) => removed || stored)
-        : removed;
+      const indexer = activeIndexer(context);
+      if (!context?.store) return indexer.removeAlertConfig(poolId, metric);
+      return context.store.removeAlertConfig(poolId, metric).then((stored) => {
+        const removed = indexer.removeAlertConfig(poolId, metric);
+        return removed || stored;
+      });
     },
   },
   PoolEvent: {

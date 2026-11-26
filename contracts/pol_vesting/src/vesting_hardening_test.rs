@@ -388,3 +388,73 @@ fn rejected_change_beneficiary_at_the_cap_leaves_state_unchanged() {
     assert_eq!(client(&s).schedule_count(&s.beneficiary), source_count);
     assert_eq!(client(&s).schedule_count(&destination), destination_count);
 }
+
+#[test]
+fn list_schedules_renews_ttl_so_release_still_pays() {
+    // A dashboard that enumerates via `list_schedules` must not let the
+    // schedule entries age out. Before the fix, `list_schedules` bumped only
+    // the beneficiary's id-list key, so a beneficiary who never called
+    // `get_vesting` or `release` would find their vested tokens unreachable
+    // once the schedule entry lapsed.
+    let s = setup_keep_alive_lp();
+    let end = 400 * DAY_LEDGERS;
+    let id = create_until(&s, end);
+
+    let lp = KeepAliveLpTokenClient::new(&s.env, &s.lp_token);
+    // Day 390 in 30-day steps. Every read here is `list_schedules` only —
+    // no `get_vesting` / `release` to renew the entry by other means.
+    for _ in 0..13 {
+        advance(&s.env, 30 * DAY_LEDGERS);
+        let page = client(&s).list_schedules(&s.beneficiary, &0, &10);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.get(0).unwrap().schedule_id, id);
+        lp.balance(&s.contract_id);
+    }
+
+    // Day 400: the schedule is fully vested. It must still be readable (it
+    // was renewed on every list call) and `release` must pay out.
+    advance(&s.env, 10 * DAY_LEDGERS);
+    assert_eq!(s.env.ledger().sequence(), end);
+    assert!(client(&s).try_get_vesting(&s.beneficiary, &id).is_ok());
+    let released = client(&s).release(&s.beneficiary, &id);
+    assert_eq!(released, TOTAL);
+}
+
+#[test]
+fn schedule_count_equals_walking_list_schedules() {
+    // `schedule_count` and the concatenation of `list_schedules` pages must
+    // always agree, even after the ledger advances and entries have been
+    // renewed (or would have lapsed, on main). Uses > MAX_PAGE schedules so
+    // the walk exercises pagination.
+    let s = setup();
+    let count = MAX_PAGE + 7;
+    for _ in 0..count {
+        client(&s).create_vesting(
+            &s.governance,
+            &s.beneficiary,
+            &s.lp_token,
+            &s.pool,
+            &1,
+            &0,
+            &0,
+            &(200 * DAY_LEDGERS),
+        );
+    }
+    assert_eq!(client(&s).schedule_count(&s.beneficiary), count);
+
+    // Advance partway through the schedule; renewal happens on every page read.
+    advance(&s.env, 100 * DAY_LEDGERS);
+
+    let mut walked = 0u32;
+    let mut offset = 0u32;
+    loop {
+        let page = client(&s).list_schedules(&s.beneficiary, &offset, &MAX_PAGE);
+        if page.is_empty() {
+            break;
+        }
+        walked += page.len();
+        offset += page.len();
+    }
+    assert_eq!(walked, count);
+    assert_eq!(client(&s).schedule_count(&s.beneficiary), count);
+}

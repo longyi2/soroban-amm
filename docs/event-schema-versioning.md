@@ -197,6 +197,8 @@ a representative call sequence and asserts every pool event carries the leading
 
 | Event | Topics | Payload |
 |---|---|---|
+| `initialized` | none | `(admin: Address, token_a: Address, token_b: Address, fee_bps: i128, initial_tick: i32, tick_spacing: i32)` |
+| `oracle_cardinality_set` | none | `(old_cardinality: u32, new_cardinality: u32)` |
 | `mint_pos` | `provider` | `(lower_tick: i32, upper_tick: i32, liquidity: i128, amount_a: i128, amount_b: i128)` |
 | `mod_pos` | `provider` | `(lower_tick: i32, upper_tick: i32, liquidity_delta: i128, amount_a: i128, amount_b: i128)` |
 | `mint_1t` | `provider` | `(lower_tick: i32, upper_tick: i32, liquidity: i128, amount_used: i128, dust: i128)` |
@@ -254,6 +256,8 @@ a representative call sequence and asserts every pool event carries the leading
 |---|---|---|
 | `governance_proposed` | — | `(current_governance: Address, new_governance: Address)` |
 | `governance_transferred` | — | `(new_governance: Address)` |
+| `min_reserve_set` | — | `(token_a: Address, token_b: Address, min_reserve_a: i128, min_reserve_b: i128, removed: bool)` |
+| `pool_kind_set` | — | `(pool: Address, kind: PoolKind)` |
 | `res_warn` | — | `(unhealthy: Vec<Address>)` |
 
 ### POL Vesting — `contracts/pol_vesting/src/lib.rs`
@@ -335,8 +339,8 @@ a representative call sequence and asserts every pool event carries the leading
 | `venue_removed` | `pool` | `()` |
 | `admin_nominated` | — | `(current_admin: Address, new_admin: Address)` |
 | `admin_changed` | — | `(new_admin: Address)` |
-| `paused` | — | `(admin: Address)` |
-| `unpaused` | — | `(admin: Address)` |
+| `pause` | — | `(admin: Address)` |
+| `unpause` | — | `(admin: Address)` |
 | `upgraded` | — | `(new_wasm_hash: BytesN<32>)` |
 
 ### V2→V3 Migration — `contracts/v2_to_v3_migration/src/lib.rs`
@@ -659,6 +663,9 @@ count. Events marked unversioned carry their payload without the
 
 | Event | Topics | Payload fields | Envelope |
 |---|---|---|---|
+| `pause` | 1 | `admin` | v1 |
+| `unpause` | 1 | `admin` | v1 |
+| `upgraded` | 1 | `new_wasm_hash` | v1 |
 | `order_submitted` | 2 | `id`, `amount_in` | v1 |
 | `order_cancelled` | 2 | `order_id` | v1 |
 | `order_expired` | 2 | `order_id` | v1 |
@@ -694,6 +701,8 @@ count. Events marked unversioned carry their payload without the
 
 | Event | Topics | Payload fields | Envelope |
 |---|---|---|---|
+| `accept_transfers_set` | 2 | `accepts` | v1 |
+| `ttl_params_set` | 1 | `min_ttl_threshold`, `bump_to` | v1 |
 | `initialized` | 1 | `admin`, `cl_pool` | v1 |
 | `admin_nominated` | 1 | `current_admin`, `new_admin` | v1 |
 | `admin_transferred` | 1 | `new_admin` | v1 |
@@ -709,6 +718,7 @@ count. Events marked unversioned carry their payload without the
 
 | Event | Topics | Payload fields | Envelope |
 |---|---|---|---|
+| `initialized` | 1 | `admin`, `token_a`, `token_b`, `fee_bps`, `initial_tick`, `tick_spacing` | v1 |
 | `upgraded` | 1 | `new_wasm_hash` | v1 |
 | `mint_pos` | 2 | `lower_tick`, `upper_tick`, `liquidity`, `amount_a`, `amount_b` | v1 |
 | `mod_pos` | 2 | `lower_tick`, `upper_tick`, `liquidity_delta`, `amount_a`, `amount_b` | v1 |
@@ -721,6 +731,7 @@ count. Events marked unversioned carry their payload without the
 | `price_upd` | 3 | `amount_in`, `amount_out`, `sqrt_price_x96`, `tick` | v1 |
 | `swap_out` | 2 | `zero_for_one`, `amount_in`, `amount_out`, `sqrt_price_x96`, `tick` | v1 |
 | `oracle_set` | 1 | `old_oracle`, `new_oracle` | v1 |
+| `oracle_cardinality_set` | 1 | `old_cardinality`, `new_cardinality` | v1 |
 | `position_nft_set` | 1 | `old_position_nft`, `new_position_nft` | v1 |
 | `max_oracle_deviation_set` | 1 | `old_deviation_bps`, `new_deviation_bps` | v1 |
 | `pause` | 1 | `admin` | v1 |
@@ -736,6 +747,9 @@ count. Events marked unversioned carry their payload without the
 |---|---|---|---|
 | `pause` | 1 | `admin` | v1 |
 | `unpause` | 1 | `admin` | v1 |
+| `admin_nominated` | 1 | `current_admin`, `new_admin` | v1 |
+| `admin_changed` | 1 | `new_admin` | v1 |
+| `upgraded` | 1 | `new_wasm_hash` | v1 |
 | `cl_reg` | 1 | `token_a`, `token_b`, `fee_bps`, `pool` | v1 |
 | `route_sel` | 1 | `venue`, `venue_kind`, `amount_in`, `amount_out` | v1 |
 | `route_alt` | 1 | `venue`, `amount_out`, `alt_venue`, `alt_venue_kind`, `alt_amount_out` | v1 |
@@ -805,6 +819,22 @@ count. Events marked unversioned carry their payload without the
 | `unpaused` | 1 | `caller` | v1 |
 | `upgraded` | 1 | `new_wasm_hash` | v1 |
 
+### `oracle_adapters`
+
+| Event | Topics | Payload fields | Envelope |
+|---|---|---|---|
+| `admin_changed` | 1 | `new_admin` | v1 |
+| `admin_proposed` | 1 | `new_admin` | v1 |
+| `consumer_updated` | 1 | `consumer` | v1 |
+| `factory_updated` | 1 | `factory` | v1 |
+| `fee_tiers_updated` | 1 | `fee_tiers` | v1 |
+| `max_age_updated` | 1 | `max_age_seconds` | v1 |
+| `mode_updated` | 1 | `mode` | v1 |
+| `paused` | 1 | `paused` | v1 |
+| `unpaused` | 1 | `paused` | v1 |
+| `upgraded` | 1 | `new_wasm_hash` | v1 |
+| `window_updated` | 1 | `window_seconds` | v1 |
+
 ### `oracle_aggregator`
 
 | Event | Topics | Payload fields | Envelope |
@@ -853,6 +883,8 @@ count. Events marked unversioned carry their payload without the
 | `unpause` | 1 | _none_ | v1 |
 | `admin_nominated` | 1 | `admin`, `new_admin` | v1 |
 | `admin_changed` | 1 | `new_admin` | v1 |
+| `min_reserve_set` | 1 | `token_a`, `token_b`, `min_reserve_a`, `min_reserve_b`, `removed` | v1 |
+| `pool_kind_set` | 1 | `pool`, `kind` | v1 |
 | `res_warn` | 1 | `unhealthy` | v1 |
 
 ### `router`

@@ -3,11 +3,16 @@
 # file in sync with it rather than the other way around.
 
 WASM_DIR := target/wasm32v1-none/release
+DOC_EXAMPLE_TARGET_DIR ?= target/doc-example
 
 SHELL := bash
 
-.PHONY: all help build release-build optimize abi check-abi test-abi test test-all fmt lint lint-js check-node-versions check check-docs check-branch-protection check-branch-protection-remote check-storage-keys check-deploy-scripts check-test-modules check-reachability \
-        size size-check doc audit bench deploy e2e clean fuzz-amm fuzz-amm-nightly fuzz-cl
+# Set SKIP_AUDIT=1 to skip the dependency audit in `make check` (e.g. when
+# cargo-audit is not installed locally). The skip is printed, never silent.
+SKIP_AUDIT ?= 0
+
+.PHONY: all help build release-build optimize abi check-abi test-abi test test-all fmt lint lint-js check-node-versions check-stellar-version check check-docs check-branch-protection check-branch-protection-remote check-storage-keys check-deploy-scripts check-test-modules check-reachability check-release-manifest \
+        size size-check doc audit bench deploy e2e clean fuzz-amm fuzz-amm-nightly fuzz-cl check-doc-commands test-doc-commands
 
 # Bare `make` explains itself instead of building.
 .DEFAULT_GOAL := help
@@ -48,16 +53,17 @@ test-abi: ## Run ABI generator/checker script tests
 	node --test scripts/check_abi.test.mjs
 
 check-doc-commands: build ## Verify documented contract invokes against built WASM interfaces
-	node scripts/check_doc_commands.mjs $(WASM_DIR)
+	cargo build --locked --release --target wasm32v1-none -p flash_loan_receiver --target-dir "$(DOC_EXAMPLE_TARGET_DIR)"
+	node scripts/check_doc_commands.mjs "$(WASM_DIR)" "$(DOC_EXAMPLE_TARGET_DIR)/wasm32v1-none/release/flash_loan_receiver.wasm"
 
 test-doc-commands: ## Run fixture tests for the documentation command checker
 	node --test scripts/check_doc_commands.test.mjs
 
-test: build ## Build, then run the full workspace test suite
-	cargo test --workspace
+test: build ## Build, then run the full workspace test suite (matches CI's "Run all tests" step)
+	cargo test --workspace --exclude amm_fuzz
 
-test-all: ## Run tests for the whole workspace
-	cargo test --workspace
+test-all: ## Run tests for the whole workspace (matches CI's "Run all tests" step)
+	cargo test --workspace --exclude amm_fuzz
 
 fuzz-amm: ## Build AMM WASM and run the deployed stateful invariant suite (CI case count)
 	cargo build --release --target wasm32v1-none -p amm -p token
@@ -83,6 +89,10 @@ lint-js: ## ESLint every JS/TS workspace (run `npm ci` at the root and in each w
 check-node-versions: ## Verify every JS package's @types/node and engines.node match .nvmrc
 	node scripts/check_node_versions.mjs
 
+check-stellar-version: ## Verify workflow stellar-cli action pins match .stellar-version
+	node scripts/check_stellar_version.mjs
+	node --test scripts/check_stellar_version.test.mjs
+
 check-docs: ## Verify docs/error-codes.md matches #[contracterror] enums
 	bash scripts/check_error_docs.sh
 
@@ -105,6 +115,9 @@ check-reachability: ## Fail if a module under a package's src/ is not reachable 
 	node scripts/check_reachability.mjs
 	node --test scripts/check_reachability.test.mjs
 
+check-release-manifest: ## Run the release manifest and artifact-set regression suite
+	bash scripts/release_manifest.test.sh
+
 size: ## Print a WASM size report for all built contracts
 	bash scripts/size_report.sh
 
@@ -121,7 +134,10 @@ audit: ## Run a security audit of dependencies (cargo install cargo-audit if mis
 	}
 	cargo audit
 
-check: fmt lint test check-docs check-branch-protection check-storage-keys check-deploy-scripts check-test-modules check-reachability size-check doc ## Run the checks CI enforces before pushing
+# `check` mirrors the gates in .github/workflows/ci.yml. Fast checks run first.
+# If you add a CI gate that has a make target, add it here in the same PR.
+check: fmt lint check-node-versions check-stellar-version check-abi test-abi check-doc-commands test-doc-commands check-docs check-branch-protection check-storage-keys check-deploy-scripts check-test-modules check-reachability size-check test doc $(if $(filter 0,$(SKIP_AUDIT)),audit) ## Run the checks CI enforces before pushing (SKIP_AUDIT=1 skips audit)
+	@if [ "$(SKIP_AUDIT)" != "0" ]; then echo "note: SKIP_AUDIT=$(SKIP_AUDIT) — dependency audit was skipped"; fi
 
 bench: build ## Run hot-path benchmarks against the optimized pool WASM (what CI measures)
 	@mkdir -p $(WASM_DIR)/optimized

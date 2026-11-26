@@ -66,11 +66,12 @@ pub enum StakingError {
     InvalidDuration = 12,
     /// A stake call supplied neither a positive amount nor a lock duration.
     NothingToStake = 13,
-    /// The boost configuration bounds are invalid (non-positive, or max below
-    /// min).
+    /// The boost configuration bounds are invalid: non-positive, max below
+    /// min, or max above `MAX_BOOST_SCALED` (#1324).
     InvalidBoostConfig = 14,
-    /// The lock-duration configuration bounds are invalid (non-positive, or
-    /// max below min).
+    /// The lock-duration configuration bounds are invalid: non-positive, max
+    /// below min, max above `MAX_LOCK_DURATION`, or `now + duration` would
+    /// overflow a `u64` (#1324).
     InvalidLockDuration = 15,
     /// Adding rewards would push the pool balance above the configured cap.
     MaxRewardPoolExceeded = 16,
@@ -109,6 +110,14 @@ const MIN_LOCK_DURATION: u64 = 7 * 24 * 3600;
 
 /// Default maximum boost multiplier (2.5Ãƒâ€”, stored as 25_000 / BOOST_SCALE).
 const DEFAULT_MAX_BOOST: i128 = 25_000;
+
+/// Hard ceiling on a configurable maximum boost multiplier (4x, stored as
+/// 40_000 / BOOST_SCALE).
+///
+/// `initialize_with_boost_config` rejects anything above this (#1324): the
+/// boost curve computes `(max_boost - min_boost) * elapsed`, so an arbitrarily
+/// large ceiling can overflow with `overflow-checks = true`.
+const MAX_BOOST_SCALED: i128 = 40_000;
 
 /// Minimum boost multiplier (1Ãƒâ€”, stored as 10_000 / BOOST_SCALE).
 const MIN_BOOST: i128 = BOOST_SCALE;
@@ -364,10 +373,19 @@ impl Staking {
         if lp_token == reward_token {
             return Err(StakingError::IdenticalTokens);
         }
-        if min_boost_scaled <= 0 || max_boost_scaled < min_boost_scaled {
+        // Upper bounds are part of the contract's safety envelope (#1324):
+        // both values feed arithmetic that assumes they are small enough not
+        // to overflow (`(max_boost - min_boost) * elapsed`, `now + duration`).
+        if min_boost_scaled <= 0
+            || max_boost_scaled < min_boost_scaled
+            || max_boost_scaled > MAX_BOOST_SCALED
+        {
             return Err(StakingError::InvalidBoostConfig);
         }
-        if min_lock_duration_secs == 0 || max_lock_duration_secs < min_lock_duration_secs {
+        if min_lock_duration_secs == 0
+            || max_lock_duration_secs < min_lock_duration_secs
+            || max_lock_duration_secs > MAX_LOCK_DURATION
+        {
             return Err(StakingError::InvalidLockDuration);
         }
         env.storage().instance().set(&DataKey::LpToken, &lp_token);
@@ -460,7 +478,11 @@ impl Staking {
 
         let (min_lock, max_lock) = Self::_lock_duration_bounds(&env);
         let clamped = new_duration_seconds.clamp(min_lock, max_lock);
-        let proposed_expiry = now + clamped;
+        // Defence in depth (#1324): a stored `max_lock` written by an older,
+        // unvalidated deployment could otherwise overflow `now + clamped`.
+        let proposed_expiry = now
+            .checked_add(clamped)
+            .ok_or(StakingError::InvalidLockDuration)?;
         let expiry = proposed_expiry.max(existing_expiry);
         let boost = Self::_boost_for_remaining(&env, expiry, now);
 
@@ -723,6 +745,7 @@ impl Staking {
 
     /// Return current admin address.
     pub fn get_admin(env: Env) -> Result<Address, StakingError> {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::Admin)
@@ -731,6 +754,7 @@ impl Staking {
 
     /// Return pending admin nominee, if any.
     pub fn get_pending_admin(env: Env) -> Option<Address> {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::PendingAdmin)
@@ -804,7 +828,11 @@ impl Staking {
         } else {
             let (min_lock, max_lock) = Self::_lock_duration_bounds(&env);
             let clamped = lock_duration_secs.clamp(min_lock, max_lock);
-            let proposed_expiry = now + clamped;
+            // Defence in depth (#1324): a stored `max_lock` written by an
+            // older, unvalidated deployment could otherwise overflow.
+            let proposed_expiry = now
+                .checked_add(clamped)
+                .ok_or(StakingError::InvalidLockDuration)?;
             // Cannot shorten an existing lock.
             let expiry = proposed_expiry.max(existing_expiry);
             let boost = Self::_boost_for_remaining(&env, expiry, now);
@@ -2003,7 +2031,11 @@ impl Staking {
         if max_dur == 0 {
             return min_boost;
         }
-        min_boost + (max_boost - min_boost) * clamped / max_dur
+        // Saturating arithmetic is defence in depth (#1324): new configs are
+        // bounded by `initialize_with_boost_config`, but a pool deployed
+        // before that validation could still hold an oversized ceiling.
+        let span = max_boost.saturating_sub(min_boost);
+        min_boost.saturating_add(span.saturating_mul(clamped) / max_dur)
     }
 
     /// Effective staked amount = raw_amount * boost / BOOST_SCALE.
@@ -2411,6 +2443,26 @@ mod tests {
         let staking = StakingClient::new(&env, &staking_addr);
 
         staking.initialize(&lp_token.address, &reward_token.address, &admin);
+
+        assert_instance_ttl_bumped(&env, &staking);
+    }
+
+    #[test]
+    fn test_admin_views_extend_instance_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_admin, _staker, staking) = setup(&env);
+        lower_instance_ttl_below_min(&env, &staking);
+        assert!(instance_ttl(&env, &staking) < MIN_TTL);
+
+        staking.get_admin();
+
+        assert_instance_ttl_bumped(&env, &staking);
+
+        lower_instance_ttl_below_min(&env, &staking);
+        assert!(instance_ttl(&env, &staking) < MIN_TTL);
+
+        staking.get_pending_admin();
 
         assert_instance_ttl_bumped(&env, &staking);
     }
@@ -4766,18 +4818,157 @@ mod tests {
             &10_000_i128,
             &30_000_i128,
             &(MIN_LOCK_DURATION + 1),
-            &(MAX_LOCK_DURATION + 1),
+            &(MAX_LOCK_DURATION - 86_400),
         );
 
         let cfg = staking.get_config();
         assert_eq!(cfg.max_boost, 30_000);
         assert_eq!(cfg.min_lock_duration, MIN_LOCK_DURATION + 1);
-        assert_eq!(cfg.max_lock_duration, MAX_LOCK_DURATION + 1);
+        assert_eq!(cfg.max_lock_duration, MAX_LOCK_DURATION - 86_400);
         let data = find_event(&env, "initialized").expect("initialized event");
         let (_, (_, _, _, _, max_b, min_l, _)) =
             <(u32, (Address, Address, Address, i128, i128, u64, u64))>::try_from_val(&env, &data)
                 .unwrap();
         assert_eq!((max_b, min_l), (30_000, MIN_LOCK_DURATION + 1));
+    }
+
+    // ── #1324: bounded boost/lock configuration ─────────────────────────────
+
+    #[test]
+    fn test_initialize_with_boost_config_rejects_oversized_max_lock_duration() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let (lp, _) = create_sac(&env, &admin);
+        let (reward, _) = create_sac(&env, &admin);
+        let staking = StakingClient::new(&env, &env.register_contract(None, Staking));
+
+        // One second past the documented ceiling traps `now + clamped` on any
+        // realistic ledger timestamp, so it must be rejected up front.
+        assert_eq!(
+            staking.try_initialize_with_boost_config(
+                &lp.address,
+                &reward.address,
+                &admin,
+                &MIN_BOOST,
+                &DEFAULT_MAX_BOOST,
+                &MIN_LOCK_DURATION,
+                &(MAX_LOCK_DURATION + 1),
+            ),
+            Err(Ok(StakingError::InvalidLockDuration))
+        );
+        // A rejected call must not write any initialization state.
+        assert_eq!(
+            staking.try_get_config(),
+            Err(Ok(StakingError::NotInitialized))
+        );
+        assert!(!env.as_contract(&staking.address, || env
+            .storage()
+            .instance()
+            .has(&DataKey::LpToken)));
+    }
+
+    #[test]
+    fn test_initialize_with_boost_config_rejects_oversized_max_boost() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let (lp, _) = create_sac(&env, &admin);
+        let (reward, _) = create_sac(&env, &admin);
+        let staking = StakingClient::new(&env, &env.register_contract(None, Staking));
+
+        assert_eq!(
+            staking.try_initialize_with_boost_config(
+                &lp.address,
+                &reward.address,
+                &admin,
+                &MIN_BOOST,
+                &(MAX_BOOST_SCALED + 1),
+                &MIN_LOCK_DURATION,
+                &MAX_LOCK_DURATION,
+            ),
+            Err(Ok(StakingError::InvalidBoostConfig))
+        );
+        assert_eq!(
+            staking.try_get_config(),
+            Err(Ok(StakingError::NotInitialized))
+        );
+        assert!(!env.as_contract(&staking.address, || env
+            .storage()
+            .instance()
+            .has(&DataKey::LpToken)));
+    }
+
+    #[test]
+    fn test_initialize_with_boost_config_accepts_exact_upper_bounds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let (lp, _) = create_sac(&env, &admin);
+        let (reward, _) = create_sac(&env, &admin);
+        let staking = StakingClient::new(&env, &env.register_contract(None, Staking));
+
+        // The ceilings are inclusive; the rejected cases are strictly above.
+        staking.initialize_with_boost_config(
+            &lp.address,
+            &reward.address,
+            &admin,
+            &MIN_BOOST,
+            &MAX_BOOST_SCALED,
+            &MIN_LOCK_DURATION,
+            &MAX_LOCK_DURATION,
+        );
+        let cfg = staking.get_config();
+        assert_eq!(cfg.max_boost, MAX_BOOST_SCALED);
+        assert_eq!(cfg.max_lock_duration, MAX_LOCK_DURATION);
+    }
+
+    #[test]
+    fn test_extend_lock_overflowing_expiry_returns_typed_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let staking_addr = env.register_contract(None, Staking);
+        let staking = StakingClient::new(&env, &staking_addr);
+        let staker = Address::generate(&env);
+
+        // Simulate a pool deployed before #1324, whose stored ceiling is
+        // unbounded: only the checked_add defends this path.
+        env.ledger().set_timestamp(1_000);
+        env.as_contract(&staking_addr, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::ConfigMaxLockDuration, &u64::MAX);
+            env.storage()
+                .persistent()
+                .set(&DataKey::LockExpiry(staker.clone()), &u64::MAX);
+        });
+
+        assert_eq!(
+            staking.try_extend_lock(&staker, &u64::MAX),
+            Err(Ok(StakingError::InvalidLockDuration))
+        );
+    }
+
+    #[test]
+    fn test_stake_locked_overflowing_expiry_returns_typed_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, staker, staking) = setup(&env);
+        let staking_addr = staking.address.clone();
+
+        env.ledger().set_timestamp(1_000);
+        env.as_contract(&staking_addr, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::ConfigMaxLockDuration, &u64::MAX);
+        });
+
+        // amount = 0 avoids the LP transfer; the huge duration still reaches
+        // the expiry computation and must fail with a typed error, not panic.
+        assert_eq!(
+            staking.try_stake_locked(&staker, &0_i128, &u64::MAX),
+            Err(Ok(StakingError::InvalidLockDuration))
+        );
     }
 
     #[test]

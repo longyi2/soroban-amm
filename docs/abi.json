@@ -1093,7 +1093,7 @@
       },
       {
         "function_v0": {
-          "doc": "Deposit tokens into the pool and receive LP shares in return.\\n\\nOn the first deposit any ratio is accepted and the initial share supply is\\nset to the geometric mean of the two amounts. Subsequent deposits must\\nmatch the current pool ratio (within integer rounding); excess tokens are\\n**not** refunded automatically \\xe2\\x80\\x94 callers should compute amounts off-chain\\nbefore calling.\\n\\nRequires `provider` to have authorized this call.\\n\\n# Parameters\\n- `provider` \\xe2\\x80\\x93 Address of the liquidity provider funding the deposit.\\n- `amount_a` \\xe2\\x80\\x93 Amount of `token_a` to deposit. Must be positive.\\n- `amount_b` \\xe2\\x80\\x93 Amount of `token_b` to deposit. Must be positive.\\n- `min_shares` \\xe2\\x80\\x93 Minimum number of LP shares the caller is willing to\\nreceive; the transaction panics if fewer would be minted (slippage guard).\\n\\n# Returns\\nThe number of LP shares minted to `provider`.\\n\\n# Panics\\n- If either `amount_a` or `amount_b` is not positive.\\n- If the shares that would be minted are less than `min_shares`.",
+          "doc": "Deposit tokens into the pool and receive LP shares in return.\\n\\nOn the first deposit any ratio is accepted and the initial share supply is\\nset to the geometric mean of the two amounts. For subsequent deposits,\\nonly the amounts backing the minted shares are retained; any excess is\\nrefunded to the provider.\\n\\nRequires `provider` to have authorized this call.\\n\\n# Parameters\\n- `provider` \\xe2\\x80\\x93 Address of the liquidity provider funding the deposit.\\n- `amount_a` \\xe2\\x80\\x93 Amount of `token_a` to deposit. Must be positive.\\n- `amount_b` \\xe2\\x80\\x93 Amount of `token_b` to deposit. Must be positive.\\n- `min_shares` \\xe2\\x80\\x93 Minimum number of LP shares the caller is willing to\\nreceive; the transaction panics if fewer would be minted (slippage guard).\\n\\n# Returns\\nThe number of LP shares minted to `provider`.\\n\\n# Panics\\n- If either `amount_a` or `amount_b` is not positive.\\n- If the shares that would be minted are less than `min_shares`.",
           "inputs": [
             {
               "doc": "",
@@ -1602,7 +1602,7 @@
       },
       {
         "function_v0": {
-          "doc": "Add liquidity with fee-on-transfer (FOT) token support.\\n\\nLike `add_liquidity` but measures the actual token amounts received\\nby the pool via pre/post balance snapshots rather than trusting the\\nnominal `amount_a`/`amount_b` values. LP shares are minted proportional\\nto what the pool actually received.\\n\\n# Parameters\\n- `min_received_a` \\xe2\\x80\\x93 Minimum actual `token_a` the pool must receive.\\n- `min_received_b` \\xe2\\x80\\x93 Minimum actual `token_b` the pool must receive.",
+          "doc": "Add liquidity with fee-on-transfer (FOT) token support.\\n\\nLike `add_liquidity` but measures the actual token amounts received\\nby the pool via pre/post balance snapshots rather than trusting the\\nnominal `amount_a`/`amount_b` values. LP shares are minted proportional\\nto what the pool actually received, and unused received amounts are\\nrefunded to the provider.\\n\\n# Parameters\\n- `min_received_a` \\xe2\\x80\\x93 Minimum actual `token_a` the pool must receive.\\n- `min_received_b` \\xe2\\x80\\x93 Minimum actual `token_b` the pool must receive.",
           "inputs": [
             {
               "doc": "",
@@ -3454,6 +3454,112 @@
     ],
     "batch_auction": [
       {
+        "function_v0": {
+          "doc": "Halt new order intake and settlement. Admin-only.",
+          "inputs": [
+            {
+              "doc": "",
+              "name": "admin",
+              "type_": "address"
+            }
+          ],
+          "name": "pause",
+          "outputs": [
+            {
+              "result": {
+                "error_type": {
+                  "udt": {
+                    "name": "AuctionError"
+                  }
+                },
+                "ok_type": {
+                  "tuple": {
+                    "value_types": []
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "function_v0": {
+          "doc": "Resume new order intake and settlement. Admin-only.",
+          "inputs": [
+            {
+              "doc": "",
+              "name": "admin",
+              "type_": "address"
+            }
+          ],
+          "name": "unpause",
+          "outputs": [
+            {
+              "result": {
+                "error_type": {
+                  "udt": {
+                    "name": "AuctionError"
+                  }
+                },
+                "ok_type": {
+                  "tuple": {
+                    "value_types": []
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "function_v0": {
+          "doc": "Replace the contract WASM in place. Admin-only.",
+          "inputs": [
+            {
+              "doc": "",
+              "name": "admin",
+              "type_": "address"
+            },
+            {
+              "doc": "",
+              "name": "new_wasm_hash",
+              "type_": {
+                "bytes_n": {
+                  "n": 32
+                }
+              }
+            }
+          ],
+          "name": "upgrade",
+          "outputs": [
+            {
+              "result": {
+                "error_type": {
+                  "udt": {
+                    "name": "AuctionError"
+                  }
+                },
+                "ok_type": {
+                  "tuple": {
+                    "value_types": []
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "function_v0": {
+          "doc": "Return the deployed batch-auction contract version.",
+          "inputs": [],
+          "name": "version",
+          "outputs": [
+            "u32"
+          ]
+        }
+      },
+      {
         "udt_struct_v0": {
           "doc": "",
           "fields": [
@@ -3598,6 +3704,16 @@
         }
       },
       {
+        "function_v0": {
+          "doc": "Whether new orders and settlement are currently halted.",
+          "inputs": [],
+          "name": "is_paused",
+          "outputs": [
+            "bool"
+          ]
+        }
+      },
+      {
         "udt_union_v0": {
           "cases": [
             {
@@ -3685,6 +3801,12 @@
               "void_v0": {
                 "doc": "Admin-settable `(min, max)` bounds for the batch window (issue #1119).\\nAbsent means `(MIN_BATCH_WINDOW_SECS, MAX_BATCH_WINDOW_SECS)`.",
                 "name": "WindowBounds"
+              }
+            },
+            {
+              "void_v0": {
+                "doc": "`true` while new orders and settlement are halted; absent means unpaused.",
+                "name": "Paused"
               }
             }
           ],
@@ -4316,6 +4438,11 @@
               "doc": "`set_window_bounds` was given `min == 0`, `min > max`, a `max` above\\n`WINDOW_BOUNDS_CEILING_SECS`, or bounds that exclude the current window\\n(issue #1119).",
               "name": "InvalidWindowBounds",
               "value": 22
+            },
+            {
+              "doc": "New orders and settlement are halted while the auction is paused.",
+              "name": "Paused",
+              "value": 23
             }
           ],
           "doc": "",
@@ -5998,7 +6125,7 @@
               "type_": "i128"
             },
             {
-              "doc": "",
+              "doc": "Minimum acceptable output; must be `>= 0` (`0` means no minimum).\\nNegative values are rejected by `validate_op` with\\n`BatchRouterError::InvalidAmount`.",
               "name": "min_out",
               "type_": "i128"
             },
@@ -6148,7 +6275,7 @@
       },
       {
         "function_v0": {
-          "doc": "Initialize the router with its admin and the factory that tracks all\\ndeployed pools.\\n\\n# Deployment window\\n\\n`initialize` is one-shot but deliberately does not call\\n`admin.require_auth()`: an attacker could authorize their own address,\\nso it would not stop a front-run, and it would break deployments whose\\nadmin is a contract that cannot sign for itself. Deployers must read\\nback `get_admin` and `get_factory` right after deployment (the deploy\\nscript does) and redeploy if either differs from the intended value.",
+          "doc": "Initialize the router with its admin and the factory that tracks all\\ndeployed pools.\\n\\n# Deployment window\\n\\n`initialize` is one-shot but deliberately does not call\\n`admin.require_auth()`: an attacker could authorize their own address,\\nso it would not stop a front-run, and it would break deployments whose\\nadmin is a contract that cannot sign for itself. Deployers must read\\nback `get_admin` and `get_factory` right after deployment (the deploy\\nscript does) and redeploy if either differs from the intended value.\\n\\n# Factory validation\\n\\nThe candidate `factory` is probed with `try_get_pool_count` before\\nanything is written, mirroring `router::initialize`. Every op resolves\\nits pool through `FactoryClient::get_pool_tokens`, a hard cross-contract\\ncall, so a wrong address would make `execute_batch`, `simulate_batch`\\nand `validate_batch` trap with an untyped host error for every batch.\\nInstead the probe returns [`BatchRouterError::InvalidFactory`] and\\nleaves storage empty, so the router stays initializable.",
           "inputs": [
             {
               "doc": "",
@@ -6346,7 +6473,7 @@
       },
       {
         "function_v0": {
-          "doc": "Read-only walk that quotes each op against current pool state without\\nexecuting or requiring auth. An AMM swap's simulated output feeds the\\nnext op's context on the same pool exactly as `execute_batch` would.\\n\\nConcentrated-liquidity venues are quoted through the pool's own\\n`estimate_price_impact`, which reads live tick state. That state cannot\\nbe replayed locally, so a second CL op on a pool an earlier op in the\\nsame batch already touched returns\\n[`BatchRouterError::UnsimulatableChain`] rather than a stale quote.",
+          "doc": "Read-only walk that quotes each op against current pool state without\\nexecuting or requiring auth. An AMM swap's simulated output feeds the\\nnext op's context on the same pool exactly as `execute_batch` would.\\n\\nConcentrated-liquidity venues are quoted through the pool's own\\n`estimate_price_impact`, which reads live tick state. That state cannot\\nbe replayed locally, so a second CL op on a pool an earlier op in the\\nsame batch already touched returns\\n[`BatchRouterError::UnsimulatableChain`] rather than a stale quote.\\n\\nAMM circuit-breaker and oracle-deviation checks are intentionally not\\nreplayed here yet; swaps that would return `Ok(0)`/revert for those\\nguards can still receive a quote from `simulate_batch`.",
           "inputs": [
             {
               "doc": "",
@@ -6479,7 +6606,7 @@
               "type_": "i128"
             },
             {
-              "doc": "",
+              "doc": "Minimum acceptable LP shares; must be `>= 0` (`0` means no minimum).\\nNegative values are rejected by `validate_op` with\\n`BatchRouterError::InvalidAmount`.",
               "name": "min_shares",
               "type_": "i128"
             },
@@ -6584,6 +6711,16 @@
               "doc": "The router is paused by its admin. Returned by `execute_batch`,\\n`simulate_batch` and `validate_batch` alike so the pre-flight never\\ndisagrees with execution.",
               "name": "Paused",
               "value": 15
+            },
+            {
+              "doc": "The AMM pool has been permanently drained via emergency withdrawal.\\nSurfaced by simulation so pre-flight does not quote untradeable pools.",
+              "name": "PoolDrained",
+              "value": 16
+            },
+            {
+              "doc": "The address passed to `initialize` as `factory` does not implement the\\nfactory interface. Rejected at deploy time so a mistyped address cannot\\nturn every later batch into an untyped host trap.",
+              "name": "InvalidFactory",
+              "value": 17
             }
           ],
           "doc": "Errors returned by [`BatchRouter`] entry points.\\n\\nSee `docs/error-codes.md` for the full description of each variant.",
@@ -6596,12 +6733,12 @@
           "doc": "",
           "fields": [
             {
-              "doc": "",
+              "doc": "Minimum acceptable token A returned; must be `>= 0` (`0` means no\\nminimum). Negative values are rejected by `validate_op` with\\n`BatchRouterError::InvalidAmount`.",
               "name": "min_a",
               "type_": "i128"
             },
             {
-              "doc": "",
+              "doc": "Minimum acceptable token B returned; must be `>= 0` (`0` means no\\nminimum). Negative values are rejected by `validate_op` with\\n`BatchRouterError::InvalidAmount`.",
               "name": "min_b",
               "type_": "i128"
             },
@@ -8816,7 +8953,7 @@
       },
       {
         "function_v0": {
-          "doc": "Returns whether `owner` accepts incoming transfers (true by default).",
+          "doc": "Returns whether `owner` accepts incoming transfers (true by default).\\n\\nAn explicit opt-out is a security/compliance preference, so a recorded\\nvalue is bumped on every read; otherwise the entry could be evicted and\\nthe getter would silently fall back to `true`, re-enabling transfers the\\nowner refused. Absent entries stay absent \\xe2\\x80\\x94 the default is `true` and\\nthere is nothing to keep alive.",
           "inputs": [
             {
               "doc": "",
@@ -10249,6 +10386,11 @@
               "doc": "`set_oracle_cardinality` was called with zero, a value smaller than the\\ncurrent cardinality, or a value above `MAX_ORACLE_CARDINALITY` (#1101).",
               "name": "InvalidOracleCardinality",
               "value": 27
+            },
+            {
+              "doc": "`set_position_nft` was given an address that is not a `cl_position_nft`\\ncontract initialized with this pool's address as its `cl_pool`.",
+              "name": "NftNotWiredToPool",
+              "value": 28
             }
           ],
           "doc": "",
@@ -10524,7 +10666,7 @@
       },
       {
         "function_v0": {
-          "doc": "One-time initialisation. Sets admin, token pair, fee, starting tick, and tick spacing.\\n\\n`tick_spacing` must be > 0. Only tick values that are exact multiples of\\n`tick_spacing` may be used as position boundaries in `mint_position`.\\nSuggested defaults: fee 5 bps \\xe2\\x86\\x92 spacing 1, fee 30 bps \\xe2\\x86\\x92 spacing 10,\\nfee 100 bps \\xe2\\x86\\x92 spacing 60.",
+          "doc": "One-time initialisation. Sets admin, token pair, fee, starting tick, and tick spacing.\\n\\n`tick_spacing` must be in `1..=MAX_TICK`. Only tick values that are exact\\nmultiples of `tick_spacing` may be used as position boundaries in `mint_position`.\\nSuggested defaults: fee 5 bps \\xe2\\x86\\x92 spacing 1, fee 30 bps \\xe2\\x86\\x92 spacing 10,\\nfee 100 bps \\xe2\\x86\\x92 spacing 60.",
           "inputs": [
             {
               "doc": "",
@@ -13226,6 +13368,63 @@
       },
       {
         "function_v0": {
+          "doc": "Upgrade the contract WASM in place. Admin-only.",
+          "inputs": [
+            {
+              "doc": "",
+              "name": "admin",
+              "type_": "address"
+            },
+            {
+              "doc": "",
+              "name": "new_wasm_hash",
+              "type_": {
+                "bytes_n": {
+                  "n": 32
+                }
+              }
+            }
+          ],
+          "name": "upgrade",
+          "outputs": [
+            {
+              "result": {
+                "error_type": {
+                  "udt": {
+                    "name": "AggregatorError"
+                  }
+                },
+                "ok_type": {
+                  "tuple": {
+                    "value_types": []
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "function_v0": {
+          "doc": "Return the stored admin address, or `NotInitialized` before `initialize`.",
+          "inputs": [],
+          "name": "get_admin",
+          "outputs": [
+            {
+              "result": {
+                "error_type": {
+                  "udt": {
+                    "name": "AggregatorError"
+                  }
+                },
+                "ok_type": "address"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "function_v0": {
           "doc": "Read-only quote for off-chain simulation (#319).",
           "inputs": [
             {
@@ -13335,6 +13534,12 @@
               "void_v0": {
                 "doc": "",
                 "name": "Admin"
+              }
+            },
+            {
+              "void_v0": {
+                "doc": "",
+                "name": "PendingAdmin"
               }
             },
             {
@@ -13458,6 +13663,54 @@
           ],
           "lib": "",
           "name": "RouteHop"
+        }
+      },
+      {
+        "function_v0": {
+          "doc": "Return the stored factory address, or `NotInitialized` before `initialize`.",
+          "inputs": [],
+          "name": "get_factory",
+          "outputs": [
+            {
+              "result": {
+                "error_type": {
+                  "udt": {
+                    "name": "AggregatorError"
+                  }
+                },
+                "ok_type": "address"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "function_v0": {
+          "doc": "Accept a pending admin nomination (step 2 of 2). Nominee-only.",
+          "inputs": [
+            {
+              "doc": "",
+              "name": "new_admin",
+              "type_": "address"
+            }
+          ],
+          "name": "accept_admin",
+          "outputs": [
+            {
+              "result": {
+                "error_type": {
+                  "udt": {
+                    "name": "AggregatorError"
+                  }
+                },
+                "ok_type": {
+                  "tuple": {
+                    "value_types": []
+                  }
+                }
+              }
+            }
+          ]
         }
       },
       {
@@ -13596,6 +13849,40 @@
       },
       {
         "function_v0": {
+          "doc": "Nominate `new_admin` as the pending admin (step 1 of 2). Admin-only.",
+          "inputs": [
+            {
+              "doc": "",
+              "name": "current_admin",
+              "type_": "address"
+            },
+            {
+              "doc": "",
+              "name": "new_admin",
+              "type_": "address"
+            }
+          ],
+          "name": "propose_admin",
+          "outputs": [
+            {
+              "result": {
+                "error_type": {
+                  "udt": {
+                    "name": "AggregatorError"
+                  }
+                },
+                "ok_type": {
+                  "tuple": {
+                    "value_types": []
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "function_v0": {
           "doc": "",
           "inputs": [
             {
@@ -13712,6 +13999,20 @@
         }
       },
       {
+        "function_v0": {
+          "doc": "Return the pending admin nominee, if any.",
+          "inputs": [],
+          "name": "get_pending_admin",
+          "outputs": [
+            {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          ]
+        }
+      },
+      {
         "udt_error_enum_v0": {
           "cases": [
             {
@@ -13740,7 +14041,7 @@
               "value": 5
             },
             {
-              "doc": "A function that reads the admin or factory was called before\\n`initialize`.",
+              "doc": "A function that reads the admin or factory (or `accept_admin` without a\\npending nomination) was called before `initialize` / nomination.",
               "name": "NotInitialized",
               "value": 6
             },
@@ -13750,7 +14051,7 @@
               "value": 7
             },
             {
-              "doc": "`pause` / `unpause` was called with an address that is not the stored\\nadmin.",
+              "doc": "An admin- or nominee-gated entrypoint (`pause`, `unpause`,\\n`propose_admin`, `accept_admin`, `upgrade`) was called with an\\naddress that does not match the stored admin or pending nominee.",
               "name": "Unauthorized",
               "value": 8
             }
@@ -19760,7 +20061,7 @@
               "value": 29
             },
             {
-              "doc": "",
+              "doc": "Reserved: never returned. `veto` takes no caller argument; it reads the\\nstored veto multisig and requires that address's authorization, so a\\nnon-multisig caller fails the host auth check before any typed error is\\nproduced.",
               "name": "NotVetoMultisig",
               "value": 30
             },
@@ -22269,7 +22570,7 @@
       },
       {
         "function_v0": {
-          "doc": "Update the reward rate for an active campaign. Governance only.\\n\\nThe accumulator is flushed to the current timestamp *before* the rate\\nchanges, so rewards already accrued at the old rate are locked in and\\nonly future seconds use the new rate.  This prevents retroactive reward\\nmanipulation via rate changes (part of bug #425).",
+          "doc": "Update the reward rate for an active campaign. Governance only.\\n\\nAn inactive campaign \\xe2\\x80\\x94 one wound down by `recover_leftover_funds` \\xe2\\x80\\x94 is\\nrejected with `CampaignInactive` before any state is touched. It can\\nnever pay out again (`claim_rewards` and `stake` reject it too), so\\nre-pricing it would rewrite `reward_rate` and append to the\\n`CampaignAccruedRewards` audit trail for a frozen campaign (#1330).\\n\\nThe accumulator is flushed to the current timestamp *before* the rate\\nchanges, so rewards already accrued at the old rate are locked in and\\nonly future seconds use the new rate.  This prevents retroactive reward\\nmanipulation via rate changes (part of bug #425).",
           "inputs": [
             {
               "doc": "",
@@ -29546,6 +29847,11 @@
               "doc": "`accept_admin` was called without a pending nomination.",
               "name": "NoPendingAdmin",
               "value": 12
+            },
+            {
+              "doc": "A hop pool rejected a swap or quote call (e.g. paused, empty reserves,\\nor another pool-level error).",
+              "name": "PoolCallFailed",
+              "value": 13
             }
           ],
           "doc": "Errors surfaced by the router.\\n\\nEvery caller-triggerable failure path returns one of these discriminants\\ninstead of trapping, so integrators can branch on the specific reason a\\nmulti-hop route failed. Discriminants 1 and 2 follow the workspace-wide\\nconvention (`AlreadyInitialized` / `NotInitialized`); see\\n`contracts/amm/src/lib.rs` `AmmError` for the reference enum.",
@@ -32106,12 +32412,12 @@
               "value": 13
             },
             {
-              "doc": "The boost configuration bounds are invalid (non-positive, or max below\\nmin).",
+              "doc": "The boost configuration bounds are invalid: non-positive, max below\\nmin, or max above `MAX_BOOST_SCALED` (#1324).",
               "name": "InvalidBoostConfig",
               "value": 14
             },
             {
-              "doc": "The lock-duration configuration bounds are invalid (non-positive, or\\nmax below min).",
+              "doc": "The lock-duration configuration bounds are invalid: non-positive, max\\nbelow min, max above `MAX_LOCK_DURATION`, or `now + duration` would\\noverflow a `u64` (#1324).",
               "name": "InvalidLockDuration",
               "value": 15
             },
@@ -37777,6 +38083,11 @@
               "doc": "`accept_keeper` was called by an address other than the pending keeper.",
               "name": "WrongPendingKeeper",
               "value": 21
+            },
+            {
+              "doc": "`delete_snapshot` refused to remove the newest snapshot or to drop the\\npool below two retained snapshots, which would leave TWAP reads without\\na valid pair of cumulative-price points.",
+              "name": "CannotDeleteRequiredSnapshot",
+              "value": 22
             }
           ],
           "doc": "",
@@ -38246,7 +38557,7 @@
       },
       {
         "function_v0": {
-          "doc": "Deletes a price snapshot from persistent storage.\\nReturns `TwapError::NoSnapshotFound` and emits no event if the snapshot does not exist.",
+          "doc": "Deletes a price snapshot from persistent storage.\\n\\nRefuses with `TwapError::CannotDeleteRequiredSnapshot` (leaving storage\\nunchanged and emitting no event) if `ledger_ts` is the newest remaining\\nsnapshot or if removing it would leave fewer than two snapshots\\n(`snapshots.len() < 3`), preserving the minimum two-point history needed\\nfor TWAP reads.\\n\\nReturns `TwapError::NoSnapshotFound` and emits no event if the snapshot\\ndoes not exist.",
           "inputs": [
             {
               "doc": "",

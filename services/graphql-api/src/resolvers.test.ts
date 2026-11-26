@@ -13,6 +13,9 @@ import { describe, it } from "node:test";
 import { ApolloServer } from "@apollo/server";
 import { typeDefs } from "./schema.js";
 import { pubsub, resolvers } from "./resolvers.js";
+import { PoolIndexer } from "./indexer.js";
+import type { AlertConfig } from "./indexer.js";
+import type { AnalyticsStore } from "./store/interface.js";
 
 const server = new ApolloServer({ typeDefs, resolvers });
 
@@ -84,6 +87,90 @@ describe("BAD_USER_INPUT reaches clients", () => {
     assert.deepEqual(JSON.parse(JSON.stringify(response.body.singleResult.data)), {
       setAlertConfig: { poolId: "pool-ok", metric: "price_deviation", thresholdBps: 50 },
     });
+  });
+});
+
+describe("alert config mutations are durable-first (#1468)", () => {
+  function rejectingStore(): AnalyticsStore {
+    return {
+      setAlertConfig: async () => {
+        throw new Error("store write failed");
+      },
+      removeAlertConfig: async () => {
+        throw new Error("store write failed");
+      },
+    } as unknown as AnalyticsStore;
+  }
+
+  it("setAlertConfig leaves the in-memory config unchanged when the store write rejects", async () => {
+    const indexer = new PoolIndexer();
+    await assert.rejects(
+      async () => {
+        await resolvers.Mutation.setAlertConfig(
+          undefined,
+          { poolId: "pool-1", metric: "price_deviation", thresholdBps: 50 },
+          { indexer, store: rejectingStore() },
+        );
+      },
+      /store write failed/,
+    );
+    assert.deepEqual(indexer.getAlertConfigs(), []);
+  });
+
+  it("removeAlertConfig keeps the in-memory config when the store write rejects", async () => {
+    const indexer = new PoolIndexer();
+    const existing = indexer.setAlertConfig({
+      poolId: "pool-1",
+      metric: "price_deviation",
+      thresholdBps: 50,
+    });
+    await assert.rejects(
+      async () => {
+        await resolvers.Mutation.removeAlertConfig(
+          undefined,
+          { poolId: "pool-1", metric: "price_deviation" },
+          { indexer, store: rejectingStore() },
+        );
+      },
+      /store write failed/,
+    );
+    assert.deepEqual(indexer.getAlertConfigs(), [existing]);
+  });
+
+  it("applies the config to both indexer and store on success", async () => {
+    const indexer = new PoolIndexer();
+    const written: AlertConfig[] = [];
+    const store = {
+      setAlertConfig: async (config: AlertConfig) => {
+        written.push(config);
+        return config;
+      },
+      removeAlertConfig: async () => true,
+    } as unknown as AnalyticsStore;
+
+    const config = await resolvers.Mutation.setAlertConfig(
+      undefined,
+      { poolId: "pool-1", metric: "price_deviation", thresholdBps: 50 },
+      { indexer, store },
+    );
+    assert.deepEqual(config, {
+      poolId: "pool-1",
+      metric: "price_deviation",
+      thresholdBps: 50,
+      thresholdValue: undefined,
+    });
+    assert.deepEqual(indexer.getAlertConfigs(), [config]);
+    assert.deepEqual(written, [config]);
+
+    assert.equal(
+      await resolvers.Mutation.removeAlertConfig(
+        undefined,
+        { poolId: "pool-1", metric: "price_deviation" },
+        { indexer, store },
+      ),
+      true,
+    );
+    assert.deepEqual(indexer.getAlertConfigs(), []);
   });
 });
 

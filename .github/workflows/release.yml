@@ -35,11 +35,39 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+
+      - name: Check Stellar CLI version pins
+        run: node scripts/check_stellar_version.mjs
+
+      - name: Check Node version pins
+        run: node scripts/check_node_versions.mjs
+
+      - name: Check event schemas against contract emit sites
+        run: node scripts/check_event_schemas.mjs
+
+      - name: Check JS/TS module reachability
+        run: node scripts/check_reachability.mjs
+
       - name: Install pinned Rust toolchain
         run: rustup show
 
-      # Use the same compile, test, lint, format, docs and ABI/error-doc gates
-      # as CI. In particular, a tag is never trusted to imply a green CI run.
+      # Run the contract-release gates before creating or publishing a release
+      # (a tag is never trusted to imply a green CI run):
+      #   - Tooling & source checks: Stellar CLI and Node version pins, event
+      #     schemas, JS/TS module reachability, error docs, storage keys, deploy
+      #     scripts, and test-module compilation.
+      #   - Rust & WASM gates: locked build, deployable artifact-set checks,
+      #     workspace tests, upgrade integration tests, hot-path benchmarks,
+      #     clippy, rustfmt, rustdoc, ABI check + fixture tests, documented
+      #     contract commands + fixture tests, and unoptimized/optimized WASM
+      #     size checks, followed by release manifest tests and testnet smoke test.
+      # CI-only checks intentionally omitted here: repository-hygiene checks
+      # (other than release_manifest.test.sh), check-branch-protection, Security
+      # audit, fuzz, go-sdk, npm-packages, python-examples, and docker-build.
       - name: Build deployable contracts with the lockfile
         run: bash scripts/build_workspace.sh
 
@@ -73,14 +101,23 @@ jobs:
       - name: Deploy script coverage check
         run: make check-deploy-scripts
 
+      - name: Check test modules are compiled
+        run: make check-test-modules
+
       - name: Install Stellar CLI
         uses: stellar/stellar-cli@v27.1.0
 
-      - name: Confirm Stellar CLI pin
-        run: test "$(cat .stellar-version)" = "27.1.0"
-
       - name: ABI check
         run: bash scripts/check_abi.sh
+
+      - name: Test ABI generator and checker
+        run: make test-abi
+
+      - name: Check documented contract commands
+        run: make check-doc-commands
+
+      - name: Test documentation command checker
+        run: make test-doc-commands
 
       - name: Check contract sizes (unoptimized)
         run: bash scripts/size_report.sh

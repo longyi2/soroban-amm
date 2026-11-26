@@ -12,6 +12,15 @@
 //!   3. After the window elapses, anyone calls `settle_batch`.
 //!   4. Settlement executes all orders atomically; output tokens go to traders.
 //!   5. Any trader may call `cancel_order` before settlement to reclaim tokens.
+//!
+//! ## Pause policy
+//!
+//! | Entry points | Policy while paused |
+//! |---|---|
+//! | `submit_order`, `submit_order_cl`, `settle_batch` | Blocked with `Paused` |
+//! | `cancel_order`, `expire_order`, `claim_refund` | Allowed for escrow recovery |
+//! | All `get_*`, `is_venue_allowed`, `list_venues`, `quote_order`, and `version` views | Read-only; allowed |
+//! | `initialize`, `pause`, `unpause`, `upgrade`, and admin configuration | Administrative; authorization still applies |
 
 #![no_std]
 
@@ -19,7 +28,8 @@ use pool_interfaces::{AmmPoolClient, ConcentratedLiquidityClient, FactoryClient}
 use soroban_amm_sdk::emit_versioned_event;
 use soroban_sdk::token::Client as SepTokenClient;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    Symbol, Vec,
 };
 
 const DEFAULT_MAX_ORDERS: u32 = 50;
@@ -55,6 +65,7 @@ const BUMP_TO: u32 = 518_400;
 /// can always `claim_refund` a stranded refund long after the order expired.
 const PERSISTENT_MIN_TTL: u32 = 172_800;
 const PERSISTENT_BUMP_TO: u32 = 3_110_400;
+pub const CONTRACT_VERSION: u32 = 1;
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -106,6 +117,8 @@ pub enum AuctionError {
     /// `WINDOW_BOUNDS_CEILING_SECS`, or bounds that exclude the current window
     /// (issue #1119).
     InvalidWindowBounds = 22,
+    /// New orders and settlement are halted while the auction is paused.
+    Paused = 23,
 }
 
 // ── Storage types ─────────────────────────────────────────────────────────────
@@ -179,6 +192,8 @@ pub enum DataKey {
     /// Admin-settable `(min, max)` bounds for the batch window (issue #1119).
     /// Absent means `(MIN_BATCH_WINDOW_SECS, MAX_BATCH_WINDOW_SECS)`.
     WindowBounds,
+    /// `true` while new orders and settlement are halted; absent means unpaused.
+    Paused,
 }
 
 fn max_orders(env: &Env) -> u32 {
@@ -216,6 +231,21 @@ fn validate_window(env: &Env, batch_window_secs: u64) -> Result<(), AuctionError
         return Err(AuctionError::InvalidBatchWindow);
     }
     Ok(())
+}
+
+fn is_paused_state(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false)
+}
+
+fn require_not_paused(env: &Env) -> Result<(), AuctionError> {
+    if is_paused_state(env) {
+        Err(AuctionError::Paused)
+    } else {
+        Ok(())
+    }
 }
 
 /// Bump the TTL of a persistent entry so it outlives the order lifetime plus
@@ -289,6 +319,7 @@ impl BatchAuction {
         deadline: u64,
     ) -> Result<u64, AuctionError> {
         extend_ttl(&env);
+        require_not_paused(&env)?;
         Self::record_order(
             env,
             trader,
@@ -333,6 +364,7 @@ impl BatchAuction {
         deadline: u64,
     ) -> Result<u64, AuctionError> {
         extend_ttl(&env);
+        require_not_paused(&env)?;
         Self::record_order(
             env,
             trader,
@@ -534,6 +566,7 @@ impl BatchAuction {
     /// to see which orders failed, and use `order_failed` events to react.
     pub fn settle_batch(env: Env) -> Result<Vec<i128>, AuctionError> {
         extend_ttl(&env);
+        require_not_paused(&env)?;
         let opened_at: u64 = env
             .storage()
             .instance()
@@ -1139,6 +1172,61 @@ impl BatchAuction {
         (pending.len(), max_orders(&env), opened_at, window_secs)
     }
 
+    /// Halt new order intake and settlement. Admin-only.
+    pub fn pause(env: Env, admin: Address) -> Result<(), AuctionError> {
+        extend_ttl(&env);
+        let stored = read_admin(&env)?;
+        if stored != admin {
+            return Err(AuctionError::Unauthorized);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &true);
+        emit_versioned_event!(env, (symbol_short!("pause"),), (admin,));
+        Ok(())
+    }
+
+    /// Resume new order intake and settlement. Admin-only.
+    pub fn unpause(env: Env, admin: Address) -> Result<(), AuctionError> {
+        extend_ttl(&env);
+        let stored = read_admin(&env)?;
+        if stored != admin {
+            return Err(AuctionError::Unauthorized);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+        emit_versioned_event!(env, (symbol_short!("unpause"),), (admin,));
+        Ok(())
+    }
+
+    /// Whether new orders and settlement are currently halted.
+    pub fn is_paused(env: Env) -> bool {
+        extend_ttl(&env);
+        is_paused_state(&env)
+    }
+
+    /// Replace the contract WASM in place. Admin-only.
+    pub fn upgrade(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), AuctionError> {
+        extend_ttl(&env);
+        let stored = read_admin(&env)?;
+        if stored != admin {
+            return Err(AuctionError::Unauthorized);
+        }
+        admin.require_auth();
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        emit_versioned_event!(env, (symbol_short!("upgraded"),), (new_wasm_hash,));
+        Ok(())
+    }
+
+    /// Return the deployed batch-auction contract version.
+    pub fn version(_env: Env) -> u32 {
+        CONTRACT_VERSION
+    }
+
     /// Update the batch window duration. Admin-only.
     ///
     /// The window must lie within the configured bounds (default
@@ -1430,7 +1518,7 @@ mod tests {
         testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
         token::{StellarAssetClient, TokenClient as StellarTokenClient},
         xdr::{ScErrorCode, ScErrorType},
-        Env, IntoVal, String, Symbol, TryFromVal, Val, Vec,
+        Env, IntoVal, String, Symbol, TryFromVal, TryIntoVal, Val, Vec,
     };
     use token::{LpToken, LpTokenClient};
 
@@ -1615,6 +1703,248 @@ mod tests {
             &far_future_deadline(env),
         );
         (ta, tb, pool, admin)
+    }
+
+    const DOCUMENTED_PUBLIC_ENTRYPOINTS: &[&str] = &[
+        "initialize",
+        "submit_order",
+        "submit_order_cl",
+        "cancel_order",
+        "settle_batch",
+        "expire_order",
+        "get_expired_orders",
+        "claim_refund",
+        "quote_order",
+        "get_pending_orders",
+        "get_batch_info",
+        "pause",
+        "unpause",
+        "is_paused",
+        "upgrade",
+        "version",
+        "set_batch_window",
+        "set_window_bounds",
+        "get_window_bounds",
+        "set_max_orders",
+        "set_factory",
+        "add_venue",
+        "remove_venue",
+        "is_venue_allowed",
+        "list_venues",
+        "propose_admin",
+        "accept_admin",
+        "get_admin",
+        "get_pending_admin",
+        "get_claimable",
+    ];
+
+    fn initialized_auction(env: &Env) -> (BatchAuctionClient<'_>, Address) {
+        let admin = Address::generate(env);
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(env, &auction_addr);
+        client.initialize(&admin, &30);
+        (client, admin)
+    }
+
+    #[test]
+    fn test_pause_policy_table_covers_every_public_function() {
+        let source = include_str!("lib.rs");
+        let impl_body = source
+            .split("impl BatchAuction {")
+            .nth(1)
+            .unwrap()
+            .split("// ── Tests")
+            .next()
+            .unwrap();
+        let mut discovered: std::vec::Vec<&str> = impl_body
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("pub fn "))
+            .map(|name| name.split('(').next().unwrap())
+            .collect();
+        discovered.sort_unstable();
+        let mut documented = DOCUMENTED_PUBLIC_ENTRYPOINTS.to_vec();
+        documented.sort_unstable();
+        assert_eq!(discovered, documented);
+    }
+
+    #[test]
+    fn test_initial_pause_state_is_false() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = initialized_auction(&env);
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    fn test_admin_can_pause() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = initialized_auction(&env);
+        client.pause(&admin);
+        assert!(client.is_paused());
+    }
+
+    #[test]
+    fn test_admin_can_unpause() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = initialized_auction(&env);
+        client.pause(&admin);
+        client.unpause(&admin);
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    fn test_non_admin_cannot_pause() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = initialized_auction(&env);
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            client.try_pause(&stranger),
+            Err(Ok(AuctionError::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn test_non_admin_cannot_unpause() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = initialized_auction(&env);
+        client.pause(&admin);
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            client.try_unpause(&stranger),
+            Err(Ok(AuctionError::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn test_submit_order_is_blocked_while_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = initialized_auction(&env);
+        client.pause(&admin);
+        let a = Address::generate(&env);
+        assert_eq!(
+            client.try_submit_order(&a, &a, &a, &a, &1, &0, &10),
+            Err(Ok(AuctionError::Paused))
+        );
+    }
+
+    #[test]
+    fn test_submit_order_cl_is_blocked_while_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = initialized_auction(&env);
+        client.pause(&admin);
+        let a = Address::generate(&env);
+        assert_eq!(
+            client.try_submit_order_cl(&a, &a, &a, &a, &1, &0, &true, &0, &None, &10),
+            Err(Ok(AuctionError::Paused))
+        );
+    }
+
+    #[test]
+    fn test_settle_batch_is_blocked_while_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = initialized_auction(&env);
+        client.pause(&admin);
+        assert_eq!(client.try_settle_batch(), Err(Ok(AuctionError::Paused)));
+    }
+
+    #[test]
+    fn test_recovery_entrypoints_remain_available_while_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = initialized_auction(&env);
+        client.pause(&admin);
+        assert_eq!(
+            client.try_cancel_order(&admin, &1),
+            Err(Ok(AuctionError::OrderNotFound))
+        );
+        assert_eq!(
+            client.try_expire_order(&1),
+            Err(Ok(AuctionError::OrderNotFound))
+        );
+        assert_eq!(
+            client.try_claim_refund(&admin, &1),
+            Err(Ok(AuctionError::NothingToClaim))
+        );
+    }
+
+    #[test]
+    fn test_repeated_pause_and_unpause_are_deterministic() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = initialized_auction(&env);
+        client.pause(&admin);
+        client.pause(&admin);
+        assert!(client.is_paused());
+        client.unpause(&admin);
+        client.unpause(&admin);
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    fn test_version_view_returns_contract_version() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = initialized_auction(&env);
+        assert_eq!(client.version(), CONTRACT_VERSION);
+    }
+
+    #[test]
+    fn test_non_admin_upgrade_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = initialized_auction(&env);
+        let stranger = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[7; 32]);
+        assert_eq!(
+            client.try_upgrade(&stranger, &hash),
+            Err(Ok(AuctionError::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn test_upgrade_same_hash_preserves_state_and_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = initialized_auction(&env);
+        let venue = Address::generate(&env);
+        client.add_venue(&admin, &venue, &PoolType::Amm);
+        client.pause(&admin);
+        let wasm = soroban_sdk::Bytes::from_slice(
+            &env,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../target/wasm32v1-none/release/batch_auction.wasm"
+            )),
+        );
+        let hash = env.deployer().upload_contract_wasm(wasm);
+
+        client.upgrade(&admin, &hash);
+
+        assert_eq!(client.get_admin(), admin);
+        assert!(client.is_paused());
+        assert!(client.is_venue_allowed(&venue));
+        assert!(env.events().all().len() >= 2);
+    }
+
+    #[test]
+    fn test_pause_events_are_versioned() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = initialized_auction(&env);
+        client.pause(&admin);
+        client.unpause(&admin);
+        let events = env.events().all();
+        assert!(events.len() >= 2);
+        let last = events.get(events.len() - 1).unwrap();
+        let payload: (u32, (Address,)) = last.2.try_into_val(&env).unwrap();
+        assert_eq!(payload.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
     }
 
     #[test]

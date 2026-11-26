@@ -19,3 +19,4 @@ soroban-sdk = { workspace = true, features = ["testutils"] }
 amm = { path = "../amm", features = ["testutils"] }
 token = { path = "../token", features = ["testutils"] }
 factory = { path = "../factory", features = ["testutils"] }
+proptest = "1"

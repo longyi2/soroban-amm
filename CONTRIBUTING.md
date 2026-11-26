@@ -73,9 +73,10 @@ you'd like to work on and we'll help you find a starting point.
 
     The pin is deliberate — see
     [Why the Stellar CLI version is pinned](#why-the-stellar-cli-version-is-pinned).
-    To move it, bump the single line in `.stellar-version` in its own PR; the
-    container follows from it, and `release.yml` pins the same version
-    through the `stellar/stellar-cli` action.
+    To move it, bump `.stellar-version` and update every
+    `stellar/stellar-cli@vX` workflow pin (`ci.yml`, `release.yml`, and
+    `smoke-test.yml`) together in one PR; `Dockerfile` reads `.stellar-version`
+    directly, and `make check-stellar-version` fails CI on any drift.
 - `make` (optional but recommended — the `Makefile` wraps the common commands).
 
 ### Why the Stellar CLI version is pinned
@@ -87,8 +88,9 @@ to be written out in three places — `Dockerfile` (25.1.0), `release.yml`
 release artifact and the CLI the smoke test deployed it with were four major
 versions apart, and `stellar contract optimize` output changing between them
 would have gone unnoticed. That is the same hazard `rust-toolchain.toml` guards
-against for the compiler, so the CLI version now lives in one file that the
-container reads, with `release.yml` pinning the same version explicitly.
+against for the compiler, so `.stellar-version` is the single source of truth
+that `Dockerfile` reads directly, while `scripts/check_stellar_version.mjs`
+enforces that `ci.yml`, `release.yml`, and `smoke-test.yml` pin the matching tag.
 
 The version is chosen deliberately rather than by taking the newest release.
 `27.1.0` is what this image can build: `--locked` compiles the CLI's own
@@ -131,8 +133,8 @@ Common tasks are wrapped in the `Makefile`:
 make help       # list every target with a one-line description (default goal)
 make build      # cargo build --release --target wasm32v1-none
 make optimize   # optimize every WASM artifact from `make build` via the Stellar CLI
-make test       # build, then run the workspace test suite
-make test-all   # run tests for the whole workspace
+make test       # build, then run the workspace test suite (excludes amm_fuzz, matches CI)
+make test-all   # run workspace tests excluding amm_fuzz (matches CI)
 make fmt        # cargo fmt --all
 make lint       # cargo clippy --all -- -D warnings
 make check-docs # verify docs/error-codes.md matches #[contracterror] enums
@@ -143,7 +145,7 @@ make size       # print a WASM size report for all built contracts
 make size-check # fail if any contract WASM exceeds the size limit
 make doc        # build workspace docs with warnings denied
 make audit      # run a security audit of dependencies (cargo-audit)
-make check      # fmt + lint + test + check-docs + check-deploy-scripts + size-check + doc (run before pushing)
+make check      # run the local equivalents of CI gates, including the dependency audit
 make bench      # hot-path benchmarks
 make deploy     # deploy contracts via scripts/deploy.sh
 make e2e        # run the end-to-end test suite
@@ -156,14 +158,27 @@ When changing a public contract interface, regenerate `docs/abi.json` with
 `make abi` and include the updated file in the same pull request. CI runs
 `make check-abi` to catch stale ABI documentation.
 
+The TypeScript SDK keeps a second oracle for the contracts it wraps:
+`packages/sdk/src/__fixtures__/contract-abi.json`, generated from the Rust
+sources. After changing a wrapped contract's entrypoints, run
+`npm run generate:abi` in `packages/sdk` and commit the result. CI runs
+`npm run check:abi` for that package alongside `make check-abi`, so a stale
+fixture fails the build instead of letting the SDK test against a signature
+that no longer exists.
+
 Before opening a PR, run:
 
 ```bash
 make check
 ```
 
-This is intended to track the same set of checks CI enforces in
-`.github/workflows/ci.yml`, so passing it locally means your PR should pass CI.
+`make check` mirrors the gates in `.github/workflows/ci.yml` that have local
+Make targets. When adding a CI gate that already has a Make target, add that
+target to `check` in the same PR.
+
+The dependency audit runs by default and requires `cargo-audit`. If it is not
+installed locally, `make check SKIP_AUDIT=1` runs the remaining checks and prints
+that the audit was skipped. This does not skip the separate CI audit.
 
 ---
 
@@ -230,7 +245,7 @@ these artifacts.
 Run the full suite:
 
 ```bash
-make test          # or: cargo test --workspace
+make test          # or: cargo test --workspace --exclude amm_fuzz
 ```
 
 Run a single crate's tests:
@@ -254,9 +269,14 @@ The release workflow uses only that version's section as the GitHub release
 body; it does not modify or upload a temporary changelog.
 
 After the PR is merged, create and push a `v*` tag on the merged commit. The
-workflow confirms that commit is reachable from `main`, builds with the pinned
-Rust toolchain and locked Cargo dependencies, runs the Rust and ABI/documentation
-gates, and checks the exact deployable WASM set. It then creates a draft release,
+workflow confirms that commit is reachable from `main`, checks Stellar CLI and
+Node version pins, event schemas, and JS/TS module reachability, builds with the
+pinned Rust toolchain and locked Cargo dependencies, runs the Rust gates
+(workspace tests, upgrade tests, benchmarks, clippy, rustfmt, rustdoc),
+documentation/contract checks (error docs, storage keys, deploy scripts,
+test-module compilation, ABI check and fixture tests, documented contract
+commands and fixture tests, WASM size limits, and release manifest tests), and
+verifies the exact deployable WASM set. It then creates a draft release,
 downloads and verifies the draft assets, and runs the testnet e2e smoke suite
 against those downloaded WASM files. The release is published only if the smoke
 test passes. The published assets include the contract WASM files,

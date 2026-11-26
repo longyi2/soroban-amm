@@ -386,3 +386,197 @@ fn simulated_swaps_match_the_contract() {
         total.partial_fills
     );
 }
+
+fn assert_same_position(
+    chain: &Chain,
+    sim: &ClPoolState,
+    provider: &Address,
+    owner: &str,
+    lower: i32,
+    upper: i32,
+    ctx: &str,
+) {
+    let on_chain = chain.client.get_position(provider, &lower, &upper);
+    let sim_pos = &sim.positions[&ClPoolState::position_key(owner, lower, upper)];
+    assert_eq!(on_chain.liquidity, sim_pos.liquidity, "{ctx}: position liquidity");
+    assert_eq!(
+        on_chain.tokens_owed,
+        (sim_pos.tokens_owed_a, sim_pos.tokens_owed_b),
+        "{ctx}: position tokens_owed"
+    );
+    assert_eq!(
+        (on_chain.fee_growth_inside_a, on_chain.fee_growth_inside_b),
+        (
+            sim_pos.fee_growth_inside_a_snapshot,
+            sim_pos.fee_growth_inside_b_snapshot
+        ),
+        "{ctx}: position fee_growth_inside snapshot"
+    );
+}
+
+fn setup_lifecycle_pool(
+    env: &Env,
+    fee_bps: i128,
+    tick_spacing: i32,
+    initial_tick: i32,
+) -> (Chain<'static>, ClPoolState) {
+    let fx = Fixture {
+        name: "lifecycle",
+        fee_bps,
+        protocol_fee_bps: 0,
+        tick_spacing,
+        initial_tick,
+        positions: &[],
+        swaps: &[],
+    };
+    let chain = deploy(env, &fx);
+    let mut sim = ClPoolState::new("A", "B", fee_bps, tick_spacing).unwrap();
+    sim.initialize_at_tick(initial_tick).unwrap();
+    (chain, sim)
+}
+
+fn mint_both(
+    chain: &Chain,
+    sim: &mut ClPoolState,
+    owner: &str,
+    lower: i32,
+    upper: i32,
+    amount_a: i128,
+    amount_b: i128,
+) -> (Address, i128) {
+    let provider = Address::generate(&chain.env);
+    for token in [&chain.token_a, &chain.token_b] {
+        StellarAssetClient::new(&chain.env, &token.address).mint(&provider, &FUNDING);
+    }
+    chain.client.mint_position(
+        &provider, &lower, &upper, &amount_a, &amount_b, &0, &0, &DEADLINE,
+    );
+    let liquidity = chain
+        .client
+        .get_position(&provider, &lower, &upper)
+        .liquidity;
+    sim.add_liquidity(owner, lower, upper, liquidity).unwrap();
+    (provider, liquidity)
+}
+
+fn swap_both(chain: &Chain, sim: &mut ClPoolState, zero_for_one: bool, amount_in: i128) {
+    let amount_out = chain.client.swap(
+        &chain.trader,
+        &zero_for_one,
+        &amount_in,
+        &0,
+        &0,
+        &DEADLINE,
+    );
+    let res = sim.swap(zero_for_one, amount_in, 0, 0).unwrap();
+    assert_eq!(res.amount_out, amount_out);
+}
+
+#[test]
+fn burn_partial_matches_contract() {
+    let env = Env::default();
+    let (chain, mut sim) = setup_lifecycle_pool(&env, 30, 10, 0);
+    let (lp, liq) = mint_both(&chain, &mut sim, "lp0", -600, 600, 1_000_000_000_000, 1_000_000_000_000);
+
+    swap_both(&chain, &mut sim, true, 50_000_000_000);
+    swap_both(&chain, &mut sim, false, 40_000_000_000);
+
+    let burn_liq = liq / 2;
+    chain.client.burn_position(&lp, &-600, &600, &burn_liq);
+    sim.remove_liquidity("lp0", -600, 600, burn_liq).unwrap();
+
+    assert_same_state(&chain, &sim, &[(-600, 600)], "after partial burn");
+    assert_same_position(&chain, &sim, &lp, "lp0", -600, 600, "after partial burn");
+
+    let on_chain_fees = chain.client.collect_fees(&lp, &-600, &600);
+    let sim_fees = sim.collect_fees("lp0", -600, 600).unwrap();
+    assert_eq!(on_chain_fees, sim_fees, "partial burn collect_fees");
+    assert!(sim_fees.0 > 0 && sim_fees.1 > 0);
+    assert_same_position(&chain, &sim, &lp, "lp0", -600, 600, "after collect_fees");
+
+    // Second collect_fees with no intervening swaps returns zero.
+    assert_eq!(chain.client.collect_fees(&lp, &-600, &600), (0, 0));
+    assert_eq!(sim.collect_fees("lp0", -600, 600).unwrap(), (0, 0));
+}
+
+#[test]
+fn burn_full_matches_contract() {
+    let env = Env::default();
+    let (chain, mut sim) = setup_lifecycle_pool(&env, 30, 10, 0);
+    let (lp, liq) = mint_both(&chain, &mut sim, "lp0", -600, 600, 1_000_000_000_000, 1_000_000_000_000);
+
+    swap_both(&chain, &mut sim, true, 80_000_000_000);
+    swap_both(&chain, &mut sim, false, 60_000_000_000);
+
+    chain.client.burn_position(&lp, &-600, &600, &liq);
+    sim.remove_liquidity("lp0", -600, 600, liq).unwrap();
+
+    assert_eq!(sim.liquidity, 0);
+    assert!(sim.ticks.is_empty());
+    assert_same_state(&chain, &sim, &[(-600, 600)], "after full burn");
+    assert_same_position(&chain, &sim, &lp, "lp0", -600, 600, "after full burn");
+
+    let on_chain_fees = chain.client.collect_fees(&lp, &-600, &600);
+    let sim_fees = sim.collect_fees("lp0", -600, 600).unwrap();
+    assert_eq!(on_chain_fees, sim_fees, "full burn collect_fees");
+    assert!(sim_fees.0 > 0 && sim_fees.1 > 0);
+    assert_eq!(sim.collect_fees("lp0", -600, 600).unwrap(), (0, 0));
+    assert_eq!(chain.client.collect_fees(&lp, &-600, &600), (0, 0));
+}
+
+#[test]
+fn collect_fees_after_tick_crossing_matches_contract() {
+    let env = Env::default();
+    let (chain, mut sim) = setup_lifecycle_pool(&env, 30, 10, 0);
+    let (lp_wide, _) = mint_both(&chain, &mut sim, "wide", -1_000, 1_000, 500_000_000_000, 500_000_000_000);
+    let (lp_narrow, _) = mint_both(&chain, &mut sim, "narrow", -200, 200, 300_000_000_000, 300_000_000_000);
+
+    // Cross out of [-200, 200) upward, then cross back down through it.
+    swap_both(&chain, &mut sim, false, 400_000_000_000);
+    assert!(sim.current_tick() >= 200, "expected tick to cross above 200");
+    swap_both(&chain, &mut sim, true, 600_000_000_000);
+    assert!(sim.current_tick() < -200, "expected tick to cross below -200");
+
+    let ranges = [(-1_000, 1_000), (-200, 200)];
+    assert_same_state(&chain, &sim, &ranges, "after crossing swaps");
+
+    for (provider, owner, lower, upper) in [
+        (&lp_wide, "wide", -1_000, 1_000),
+        (&lp_narrow, "narrow", -200, 200),
+    ] {
+        let on_chain_fees = chain.client.collect_fees(provider, &lower, &upper);
+        let sim_fees = sim.collect_fees(owner, lower, upper).unwrap();
+        assert_eq!(on_chain_fees, sim_fees, "{owner}: collect_fees after crossing");
+        assert!(sim_fees.0 > 0 && sim_fees.1 > 0, "{owner}: expected non-zero fees");
+        assert_same_position(&chain, &sim, provider, owner, lower, upper, owner);
+        assert_eq!(sim.collect_fees(owner, lower, upper).unwrap(), (0, 0));
+        assert_eq!(chain.client.collect_fees(provider, &lower, &upper), (0, 0));
+    }
+}
+
+#[test]
+fn burn_to_zero_deletes_tick_matches_contract() {
+    let env = Env::default();
+    let (chain, mut sim) = setup_lifecycle_pool(&env, 30, 10, 0);
+    let (lp1, liq1) = mint_both(&chain, &mut sim, "lp1", -600, 600, 500_000_000_000, 500_000_000_000);
+    let (lp2, liq2) = mint_both(&chain, &mut sim, "lp2", -300, 600, 300_000_000_000, 300_000_000_000);
+
+    swap_both(&chain, &mut sim, true, 20_000_000_000);
+
+    // Burning lp2 to zero must delete tick -300 while keeping shared tick 600.
+    chain.client.burn_position(&lp2, &-300, &600, &liq2);
+    sim.remove_liquidity("lp2", -300, 600, liq2).unwrap();
+
+    assert!(!sim.ticks.contains_key(&-300), "tick -300 should be deleted");
+    assert!(sim.ticks.contains_key(&600), "shared tick 600 should remain");
+    assert_same_state(&chain, &sim, &[(-600, 600)], "after burning lp2");
+    assert_same_position(&chain, &sim, &lp2, "lp2", -300, 600, "after burning lp2");
+
+    // Burning lp1 to zero deletes the remaining ticks -600 and 600.
+    chain.client.burn_position(&lp1, &-600, &600, &liq1);
+    sim.remove_liquidity("lp1", -600, 600, liq1).unwrap();
+
+    assert!(sim.ticks.is_empty(), "all ticks should be deleted");
+    assert_same_state(&chain, &sim, &[(-600, 600)], "after burning lp1");
+    assert_same_position(&chain, &sim, &lp1, "lp1", -600, 600, "after burning lp1");
+}

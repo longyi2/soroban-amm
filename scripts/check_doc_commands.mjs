@@ -82,13 +82,13 @@ function commandsFromBlock(block) {
         const continues = /\\\s*$/.test(line);
         pending += `${pending ? ' ' : ''}${line.replace(/\s*\\\s*$/, '')}`;
         if (continues) continue;
-        if (pending.includes('stellar contract invoke')) {
+        if (/\b(?:stellar|soroban) contract invoke\b/.test(pending)) {
             commands.push({ text: pending, line: firstLine, annotation });
             annotation = null;
         }
         pending = '';
     }
-    if (pending.includes('stellar contract invoke')) commands.push({ text: pending, line: firstLine, annotation });
+    if (/\b(?:stellar|soroban) contract invoke\b/.test(pending)) commands.push({ text: pending, line: firstLine, annotation });
     return commands;
 }
 
@@ -208,6 +208,10 @@ export function validateMarkdown(markdown, file, interfaces) {
     const errors = [];
     for (const block of parseFences(markdown)) {
         for (const command of commandsFromBlock(block)) {
+            if (/\bsoroban contract invoke\b/.test(command.text)) {
+                errors.push(`${file}:${command.line}: use \`stellar contract invoke\` instead of the legacy \`soroban contract invoke\``);
+                continue;
+            }
             const invocation = parseInvocation(command.text);
             if (!invocation) continue;
             const { functionName, flagsBefore, flagsAfter } = invocation;
@@ -271,8 +275,14 @@ function loadInterfaces(wasmDir, stellar) {
 function main() {
     const wasmDir = resolve(process.argv[2] ?? join(ROOT, 'target/wasm32v1-none/release'));
     let interfaces;
+    const exampleWasm = resolve(process.argv[3] ?? join(ROOT, 'target/doc-example/wasm32v1-none/release/flash_loan_receiver.wasm'));
+    const stellar = process.env.STELLAR_BIN ?? 'stellar';
     try {
-        interfaces = loadInterfaces(wasmDir, process.env.STELLAR_BIN ?? 'stellar');
+        interfaces = loadInterfaces(wasmDir, stellar);
+        // The receiver is an example, not a release artifact. Use its separately
+        // built WASM to check the real interface without changing the release set.
+        const output = execFileSync(stellar, ['-q', 'contract', 'info', 'interface', '--wasm', exampleWasm, '--output', 'json'], { encoding: 'utf8' });
+        interfaces.flash_loan_receiver = JSON.parse(output);
     } catch (error) {
         console.error(`ERROR: Could not load contract interfaces from ${wasmDir}: ${error.message}`);
         process.exitCode = 2;

@@ -10,7 +10,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Vec,
 };
 
-use pool_interfaces::{AmmPoolClient, FactoryClient};
+use pool_interfaces::{AmmError, AmmPoolClient, FactoryClient};
 
 const MIN_TTL: u32 = 172_800;
 const BUMP_TO: u32 = 518_400;
@@ -52,6 +52,9 @@ pub enum RouterError {
     InvalidFactory = 11,
     /// `accept_admin` was called without a pending nomination.
     NoPendingAdmin = 12,
+    /// A hop pool rejected a swap or quote call (e.g. paused, empty reserves,
+    /// or another pool-level error).
+    PoolCallFailed = 13,
 }
 
 #[contracttype]
@@ -151,13 +154,13 @@ impl Router {
             // hop, so only that hop passes a non-zero minimum to the pool.
             let hop_min_out = if i + 1 == hops { min_amount_out } else { 0 };
 
-            current_amount = AmmPoolClient::new(&env, &pool).swap(
+            current_amount = Self::map_pool_result(AmmPoolClient::new(&env, &pool).try_swap(
                 &trader,
                 &token_in,
                 &current_amount,
                 &hop_min_out,
                 &deadline,
-            );
+            ))?;
         }
 
         if current_amount < min_amount_out {
@@ -212,13 +215,13 @@ impl Router {
 
             let expected_out = amounts_in.get(i + 1).unwrap();
 
-            let actual_out = AmmPoolClient::new(&env, &pool).swap(
+            let actual_out = Self::map_pool_result(AmmPoolClient::new(&env, &pool).try_swap(
                 &trader,
                 &token_in,
                 &current_amount_in,
                 &expected_out,
                 &deadline,
-            );
+            ))?;
 
             if actual_out < expected_out {
                 return Err(RouterError::SlippageExceeded);
@@ -266,8 +269,9 @@ impl Router {
                 None => return Ok(0),
             };
 
-            current_amount =
-                AmmPoolClient::new(&env, &pool).get_amount_out(&token_in, &current_amount);
+            current_amount = Self::map_pool_result(
+                AmmPoolClient::new(&env, &pool).try_get_amount_out(&token_in, &current_amount),
+            )?;
         }
 
         Ok(current_amount)
@@ -546,7 +550,9 @@ impl Router {
         for i in 0..hops {
             let token_in = path.get(i).unwrap();
             let pool = Self::pool_for_hop(factory, path, i)?;
-            current = AmmPoolClient::new(env, &pool).get_amount_out(&token_in, &current);
+            current = Self::map_pool_result(
+                AmmPoolClient::new(env, &pool).try_get_amount_out(&token_in, &current),
+            )?;
             amounts.push_back(current);
         }
         Ok(amounts)
@@ -571,12 +577,29 @@ impl Router {
         for i in (0..hops).rev() {
             let token_out = path.get(i + 1).unwrap();
             let pool = Self::pool_for_hop(factory, path, i)?;
-            let required_in =
-                AmmPoolClient::new(env, &pool).get_amount_in(&token_out, &current_out);
+            let required_in = Self::map_pool_result(
+                AmmPoolClient::new(env, &pool).try_get_amount_in(&token_out, &current_out),
+            )?;
             amounts.push_front(required_in);
             current_out = required_in;
         }
         Ok(amounts)
+    }
+
+    /// Convert a `try_*` `AmmPoolClient` result into a typed `RouterError`.
+    ///
+    /// Maps pool-level `SlippageExceeded` and `DeadlineExceeded` to their
+    /// matching `RouterError` variants, and all other pool rejections or
+    /// cross-contract call failures to `RouterError::PoolCallFailed`.
+    fn map_pool_result<T, C, I>(
+        res: Result<Result<T, C>, Result<AmmError, I>>,
+    ) -> Result<T, RouterError> {
+        match res {
+            Ok(Ok(val)) => Ok(val),
+            Err(Ok(AmmError::SlippageExceeded)) => Err(RouterError::SlippageExceeded),
+            Err(Ok(AmmError::DeadlineExceeded)) => Err(RouterError::DeadlineExceeded),
+            _ => Err(RouterError::PoolCallFailed),
+        }
     }
 }
 
@@ -672,10 +695,10 @@ mod tests {
         let router = RouterClient::new(&env, &router_addr);
         let path = soroban_sdk::vec![&env, token1.clone(), token2.clone(), token3.clone()];
         // The final hop carries `min_amount_out` down to the pool, so an
-        // unreachable floor trips the pool's own slippage guard first and
-        // surfaces as a sub-call host error, not a `RouterError`.
+        // unreachable floor trips the pool's own slippage guard first, which
+        // the router maps to its own error discriminant.
         let result = router.try_swap_exact_in(&trader, &path, &100_000, &1_000_000_000, &u64::MAX);
-        assert!(result.is_err());
+        assert_eq!(result, Err(Ok(RouterError::SlippageExceeded)));
     }
 
     #[test]
@@ -781,6 +804,80 @@ mod tests {
             factory: factory_addr,
             admin,
         }
+    }
+
+    #[test]
+    fn test_paused_second_hop_returns_typed_error() {
+        let s = setup_three_hop();
+        let pool = FactoryClient::new(&s.env, &s.factory)
+            .get_pool(&s.token2, &s.token3)
+            .unwrap();
+        amm::AmmPoolClient::new(&s.env, &pool).pause();
+        let router = RouterClient::new(&s.env, &s.router);
+        let path = soroban_sdk::vec![&s.env, s.token1, s.token2, s.token3];
+
+        assert_eq!(
+            router.try_swap_exact_in(&s.trader, &path, &1_000, &0, &u64::MAX),
+            Err(Ok(RouterError::PoolCallFailed)),
+        );
+        assert_eq!(
+            router.try_swap_exact_out(&s.trader, &path, &100, &10_000, &u64::MAX),
+            Err(Ok(RouterError::PoolCallFailed)),
+        );
+    }
+
+    fn create_empty_hop(s: &ThreeHop) -> Vec<Address> {
+        FactoryClient::new(&s.env, &s.factory)
+            .create_pool(&s.admin, &s.token2, &s.orphan, &2, &None);
+        soroban_sdk::vec![&s.env, s.token1.clone(), s.token2.clone(), s.orphan.clone()]
+    }
+
+    #[test]
+    fn test_empty_second_hop_returns_typed_error() {
+        let s = setup_three_hop();
+        let path = create_empty_hop(&s);
+        let router = RouterClient::new(&s.env, &s.router);
+
+        assert_eq!(
+            router.try_swap_exact_in(&s.trader, &path, &1_000, &0, &u64::MAX),
+            Err(Ok(RouterError::PoolCallFailed)),
+        );
+    }
+
+    #[test]
+    fn test_quote_paths_return_typed_error_for_empty_second_hop() {
+        let s = setup_three_hop();
+        let path = create_empty_hop(&s);
+        let router = RouterClient::new(&s.env, &s.router);
+
+        assert_eq!(
+            router.try_get_amount_out_path(&path, &1_000),
+            Err(Ok(RouterError::PoolCallFailed))
+        );
+        assert_eq!(
+            router.try_get_amounts_out_path(&path, &1_000),
+            Err(Ok(RouterError::PoolCallFailed))
+        );
+        assert_eq!(
+            router.try_get_amount_in_path(&path, &100),
+            Err(Ok(RouterError::PoolCallFailed))
+        );
+        assert_eq!(
+            router.try_get_amounts_in_path(&path, &100),
+            Err(Ok(RouterError::PoolCallFailed))
+        );
+    }
+
+    #[test]
+    fn test_hop_deadline_error_keeps_router_deadline_discriminant() {
+        // Real hops share the router's ledger deadline; exercise the mapper
+        // directly to isolate an error returned by the hop itself.
+        let result: Result<Result<i128, ()>, Result<AmmError, ()>> =
+            Err(Ok(AmmError::DeadlineExceeded));
+        assert_eq!(
+            Router::map_pool_result(result),
+            Err(RouterError::DeadlineExceeded)
+        );
     }
 
     // -- #683: exact-out quoting, per-hop breakdowns, path validation ---------
@@ -1410,5 +1507,209 @@ mod tests {
     #[test]
     fn test_ttl_bump_is_paused() {
         assert_view_ttl_bump(6);
+    }
+
+    mod prop_tests {
+        use super::*;
+        use proptest::prelude::*;
+        use proptest::test_runner::RngSeed;
+
+        #[derive(Debug, Clone)]
+        struct RandomRouteCase {
+            num_pools: usize,
+            fee_tiers: [i128; 4],
+            deposits_a: [i128; 4],
+            deposits_b: [i128; 4],
+            start_idx: usize,
+            path_len: usize,
+            reverse: bool,
+            amount_in: i128,
+        }
+
+        fn route_case_strategy() -> impl Strategy<Value = RandomRouteCase> {
+            (
+                2usize..=4,
+                prop::array::uniform4(0i128..=3),
+                prop::array::uniform4(200_000i128..=5_000_000),
+                prop::array::uniform4(200_000i128..=5_000_000),
+                2usize..=4,
+                0usize..=4,
+                any::<bool>(),
+                1_000i128..=20_000,
+            )
+                .prop_map(
+                    |(
+                        num_pools,
+                        fee_tiers,
+                        deposits_a,
+                        deposits_b,
+                        raw_path_len,
+                        raw_start,
+                        reverse,
+                        amount_in,
+                    )| {
+                        let num_tokens = num_pools + 1;
+                        let path_len = raw_path_len.min(num_tokens);
+                        let max_start = num_tokens - path_len;
+                        let start_idx = if max_start == 0 {
+                            0
+                        } else {
+                            raw_start % (max_start + 1)
+                        };
+                        RandomRouteCase {
+                            num_pools,
+                            fee_tiers,
+                            deposits_a,
+                            deposits_b,
+                            start_idx,
+                            path_len,
+                            reverse,
+                            amount_in,
+                        }
+                    },
+                )
+        }
+
+        struct RandomRouteFixture {
+            env: Env,
+            router: Address,
+            trader: Address,
+            path: soroban_sdk::Vec<Address>,
+        }
+
+        fn setup_random_route(case: &RandomRouteCase) -> RandomRouteFixture {
+            let env = Env::default();
+            env.mock_all_auths();
+            env.budget().reset_unlimited();
+
+            let admin = Address::generate(&env);
+            let amm_wasm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+            let lp_wasm_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+            let factory_addr = env.register_contract(None, Factory);
+            let factory = FactoryClient::new(&env, &factory_addr);
+            factory.initialize(&admin, &amm_wasm_hash, &lp_wasm_hash);
+
+            let router_addr = env.register_contract(None, Router);
+            RouterClient::new(&env, &router_addr).initialize(&admin, &factory_addr);
+
+            let num_tokens = case.num_pools + 1;
+            let mut tokens: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+            for _ in 0..num_tokens {
+                tokens.push_back(
+                    env.register_stellar_asset_contract_v2(admin.clone())
+                        .address(),
+                );
+            }
+
+            let lp = Address::generate(&env);
+            let trader = Address::generate(&env);
+            for i in 0..tokens.len() {
+                let t = tokens.get(i).unwrap();
+                StellarAssetClient::new(&env, &t).mint(&lp, &100_000_000_i128);
+                StellarAssetClient::new(&env, &t).mint(&trader, &10_000_000_i128);
+            }
+
+            for i in 0..case.num_pools {
+                let a = tokens.get(i as u32).unwrap();
+                let b = tokens.get((i + 1) as u32).unwrap();
+                factory.create_pool(&admin, &a, &b, &case.fee_tiers[i], &None);
+                let pool = factory.get_pool(&a, &b).unwrap();
+                amm::AmmPoolClient::new(&env, &pool).add_liquidity(
+                    &lp,
+                    &case.deposits_a[i],
+                    &case.deposits_b[i],
+                    &0,
+                    &u64::MAX,
+                );
+            }
+
+            let mut path: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+            if case.reverse {
+                for offset in (0..case.path_len).rev() {
+                    path.push_back(tokens.get((case.start_idx + offset) as u32).unwrap());
+                }
+            } else {
+                for offset in 0..case.path_len {
+                    path.push_back(tokens.get((case.start_idx + offset) as u32).unwrap());
+                }
+            }
+
+            RandomRouteFixture {
+                env,
+                router: router_addr,
+                trader,
+                path,
+            }
+        }
+
+        fn deterministic_config(seed: u64) -> ProptestConfig {
+            ProptestConfig {
+                cases: 256,
+                failure_persistence: None,
+                rng_seed: RngSeed::Fixed(seed),
+                ..ProptestConfig::default()
+            }
+        }
+
+        proptest! {
+            #![proptest_config(deterministic_config(0x524f_5554_4552_0001))]
+            #[test]
+            fn prop_amounts_out_path_last_matches_scalar_quote(case in route_case_strategy()) {
+                let f = setup_random_route(&case);
+                let router = RouterClient::new(&f.env, &f.router);
+
+                let breakdown = router.get_amounts_out_path(&f.path, &case.amount_in);
+                let scalar = router.get_amount_out_path(&f.path, &case.amount_in);
+
+                prop_assert_eq!(breakdown.len(), f.path.len());
+                prop_assert_eq!(breakdown.get(0).unwrap(), case.amount_in);
+                prop_assert_eq!(breakdown.last().unwrap(), scalar);
+            }
+        }
+
+        proptest! {
+            #![proptest_config(deterministic_config(0x524f_5554_4554_0002))]
+            #[test]
+            fn prop_swap_exact_out_matches_quote(case in route_case_strategy()) {
+                let f = setup_random_route(&case);
+                let router = RouterClient::new(&f.env, &f.router);
+
+                let out = router.get_amount_out_path(&f.path, &case.amount_in);
+                prop_assume!(out > 0);
+
+                let quoted_in = router.get_amount_in_path(&f.path, &out);
+                let spent = router.swap_exact_out(
+                    &f.trader,
+                    &f.path,
+                    &out,
+                    &quoted_in,
+                    &u64::MAX,
+                );
+                prop_assert_eq!(spent, quoted_in);
+            }
+        }
+
+        proptest! {
+            #![proptest_config(deterministic_config(0x524f_5554_4552_0003))]
+            #[test]
+            fn prop_round_trip_in_out_bounded_by_hops(case in route_case_strategy()) {
+                let f = setup_random_route(&case);
+                let router = RouterClient::new(&f.env, &f.router);
+
+                let out = router.get_amount_out_path(&f.path, &case.amount_in);
+                prop_assume!(out > 0);
+
+                let round_trip = router.get_amount_in_path(&f.path, &out);
+                let hops = (f.path.len() - 1) as i128;
+                prop_assert!(
+                    round_trip <= case.amount_in + hops,
+                    "round_trip ({}) exceeded amount_in ({}) + hops ({})",
+                    round_trip,
+                    case.amount_in,
+                    hops
+                );
+            }
+        }
     }
 }

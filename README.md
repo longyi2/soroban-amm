@@ -391,17 +391,13 @@ You are now ready to build, test, and deploy.
 
 ### Build
 
-Build all contracts as optimised WASM binaries:
-
-```sh
-cargo build --release --target wasm32v1-none
-```
-
-Or via the Makefile alias:
+Build all deployable contracts as optimised WASM binaries:
 
 ```sh
 make build
 ```
+
+This calls `scripts/build_workspace.sh`, which excludes crates that are not deployable contracts (`soroban_amm_simulator`, `amm_fuzz`, `integration_tests`, `benches`, `flash_loan_receiver`, and `soroban_amm_sdk`) — the same set CI and the release workflow exclude. A plain `cargo build --release --target wasm32v1-none` at the workspace root would also attempt to build those crates, some of which have host-only dependencies that do not compile for `wasm32v1-none`.
 
 To optimize the compiled WASM binaries for size (typically reducing size by 20-40% using `wasm-opt` through Stellar CLI):
 
@@ -422,16 +418,15 @@ target/wasm32v1-none/release/concentrated_liquidity.wasm
 
 ### Test
 
-Run the full test suite across all packages:
+Run the full test suite:
 
 ```sh
-cargo build --release --target wasm32v1-none
-cargo test --workspace
+make test
 ```
 
-The factory tests embed compiled WASM at compile time, so the build step is required before running tests. All other packages can be tested independently without a prior build.
+`make test` builds the deployable contracts first (required because the factory tests embed compiled WASM at compile time), then runs `cargo test --workspace --exclude amm_fuzz`.
 
-The same command runs in CI on every pull request.
+CI splits this into two jobs on every pull request: the main test run (`cargo test --workspace --exclude amm_fuzz`) and a separate fuzz job (`amm_fuzz`) that uses a property-based harness. `make test` covers the same package set as the main CI job.
 
 For a real-network smoke test on Stellar testnet, run the end-to-end script:
 
@@ -745,12 +740,13 @@ reference for envelope construction and ScVal encoding.
 
 ### TypeScript Client Example
 
-A standalone TypeScript client is available in [examples/client](examples/client). It demonstrates connecting to Stellar testnet RPC, reading `get_info()`, quoting with `get_amount_out()`, executing `swap()`, and reading LP shares with `shares_of()`.
+A standalone TypeScript client is available in [examples/client](examples/client). It demonstrates connecting to Stellar testnet RPC, reading `get_info()`, quoting a swap with `simulateSwap()` (off-chain, no transaction), applying slippage and deadline bounds, signing and submitting the swap via `AmmPool.swap()`, and reading LP shares with `shares_of()`. Add-liquidity and remove-liquidity follow the same signed flow and are opt-in via environment variables.
 
 ```sh
 cd examples/client
 npm install
 npm run build
+# Set AMM_CONTRACT_ID, TOKEN_IN_CONTRACT_ID, SOURCE_ADDRESS, SIGNING_SECRET_KEY
 npm start
 ```
 
@@ -823,8 +819,8 @@ Contributions are welcome. See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the fu
 2. **Make your changes**, then ensure the build and tests pass:
 
    ```sh
-   cargo build --release --target wasm32v1-none
-   cargo test --workspace
+   make build
+   make test
    ```
 
 3. **Write tests** for any new behavior. All public functions should have at least one test. Tests live alongside the implementation in `src/lib.rs` under a `#[cfg(test)]` module.
@@ -863,7 +859,7 @@ Before requesting review, confirm:
 
 - [ ] `cargo fmt` has been run
 - [ ] `cargo clippy -- -D warnings` passes
-- [ ] `cargo test --workspace` passes
+- [ ] `cargo test --workspace --exclude amm_fuzz` passes
 - [ ] New behavior is covered by tests
 - [ ] Public interface and error documentation updated (`docs/abi.json`, `docs/error-codes.md`)
 - [ ] `CHANGELOG.md` has been updated with any notable changes

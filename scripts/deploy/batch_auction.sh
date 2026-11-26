@@ -55,9 +55,14 @@ deploy_batch_auction() {
   fi
 
   CURRENT_STEP="verify batch_auction"
-  if invoke_read "$BATCH_AUCTION_CONTRACT_ID" get_admin 2>/dev/null | grep -q "$ADMIN_ADDRESS" || invoke_read "$BATCH_AUCTION_CONTRACT_ID" get_batch_window >/dev/null 2>/dev/null; then
-    log "verified batch_auction liveness"
+  local paused version
+  paused=$(invoke_read "$BATCH_AUCTION_CONTRACT_ID" is_paused 2>/dev/null || echo "")
+  version=$(invoke_read "$BATCH_AUCTION_CONTRACT_ID" version 2>/dev/null || echo "")
+  if invoke_read "$BATCH_AUCTION_CONTRACT_ID" get_admin 2>/dev/null | grep -q "$ADMIN_ADDRESS" \
+    && [[ "$paused" == *false* ]] \
+    && [[ "$version" == *1* ]]; then
+    log "verified batch_auction liveness (paused=$paused version=$version)"
   else
-    warn "batch_auction verification warning"
+    warn "batch_auction verification warning (paused=$paused version=$version)"
   fi
 }

@@ -364,6 +364,7 @@ impl ReserveManager {
     }
 
     pub fn pause(env: Env) -> Result<(), ReserveManagerError> {
+        Self::extend_instance_ttl(&env);
         let gov: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
         gov.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
@@ -372,6 +373,7 @@ impl ReserveManager {
     }
 
     pub fn unpause(env: Env) -> Result<(), ReserveManagerError> {
+        Self::extend_instance_ttl(&env);
         let gov: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
         gov.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
@@ -380,6 +382,7 @@ impl ReserveManager {
     }
 
     pub fn is_paused(env: Env) -> bool {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::Paused)
@@ -478,16 +481,19 @@ impl ReserveManager {
 
         let token_a_is_first = token_a < token_b;
         let (ta, tb) = Self::normalize(token_a, token_b);
-        let key = DataKey::MinReserve(ta, tb);
+        let key = DataKey::MinReserve(ta.clone(), tb.clone());
 
         // Both minimums zero means "no requirement": delete the entry so it does
         // not linger, matching the documented behaviour above, and drop the pair
         // from the enumeration index so it cannot grow without bound.
         if min_reserve_a == 0 && min_reserve_b == 0 {
             env.storage().persistent().remove(&key);
-            if let DataKey::MinReserve(ta, tb) = &key {
-                Self::deindex_pair(&env, ta, tb);
-            }
+            Self::deindex_pair(&env, &ta, &tb);
+            emit_versioned_event!(
+                env,
+                (Symbol::new(&env, "min_reserve_set"),),
+                (ta, tb, 0_i128, 0_i128, true)
+            );
             return Ok(());
         }
 
@@ -504,9 +510,12 @@ impl ReserveManager {
         env.storage()
             .persistent()
             .extend_ttl(&key, MIN_PERSISTENT_TTL, PERSISTENT_TTL_BUMP_TO);
-        if let DataKey::MinReserve(ta, tb) = &key {
-            Self::index_pair(&env, ta, tb);
-        }
+        Self::index_pair(&env, &ta, &tb);
+        emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "min_reserve_set"),),
+            (ta, tb, normalized_min_a, normalized_min_b, false)
+        );
         Ok(())
     }
 
@@ -546,13 +555,7 @@ impl ReserveManager {
     pub fn get_min_reserve(env: Env, token_a: Address, token_b: Address) -> ReserveRequirement {
         Self::extend_instance_ttl(&env);
         let (ta, tb) = Self::normalize(token_a, token_b);
-        env.storage()
-            .persistent()
-            .get(&DataKey::MinReserve(ta, tb))
-            .unwrap_or(ReserveRequirement {
-                min_reserve_a: 0,
-                min_reserve_b: 0,
-            })
+        Self::read_min_reserve(&env, &ta, &tb)
     }
 
     // ── Compliance checks ─────────────────────────────────────────────────────
@@ -589,14 +592,7 @@ impl ReserveManager {
         };
 
         let (ta, tb) = Self::normalize(token_a.clone(), token_b.clone());
-        let req: ReserveRequirement = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MinReserve(ta.clone(), tb))
-            .unwrap_or(ReserveRequirement {
-                min_reserve_a: 0,
-                min_reserve_b: 0,
-            });
+        let req = Self::read_min_reserve(&env, &ta, &tb);
 
         // The requirement is stored against the normalized pair, so align the
         // observed reserves with that same ordering before comparing.
@@ -630,11 +626,12 @@ impl ReserveManager {
         }
         let gov: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
         gov.require_auth();
-        let key = DataKey::PoolKind(pool);
+        let key = DataKey::PoolKind(pool.clone());
         env.storage().persistent().set(&key, &kind);
         env.storage()
             .persistent()
             .extend_ttl(&key, MIN_PERSISTENT_TTL, PERSISTENT_TTL_BUMP_TO);
+        emit_versioned_event!(env, (Symbol::new(&env, "pool_kind_set"),), (pool, kind));
         Ok(())
     }
 
@@ -803,6 +800,24 @@ impl ReserveManager {
         }
     }
 
+    /// Read a per-pair minimum reserve requirement and, when present, extend its
+    /// persistent TTL so a configured floor stays alive on read.
+    fn read_min_reserve(env: &Env, ta: &Address, tb: &Address) -> ReserveRequirement {
+        let key = DataKey::MinReserve(ta.clone(), tb.clone());
+        let req = env.storage().persistent().get(&key);
+        if let Some(req) = req {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, MIN_PERSISTENT_TTL, PERSISTENT_TTL_BUMP_TO);
+            req
+        } else {
+            ReserveRequirement {
+                min_reserve_a: 0,
+                min_reserve_b: 0,
+            }
+        }
+    }
+
     /// Build a report from a resolved `(token_a, token_b, reserve_a, reserve_b)`
     /// tuple, expressed in the pool's own token order.
     fn build_report(
@@ -818,14 +833,7 @@ impl ReserveManager {
             (token_b.clone(), token_a.clone())
         };
 
-        let req: ReserveRequirement = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MinReserve(ta, tb))
-            .unwrap_or(ReserveRequirement {
-                min_reserve_a: 0,
-                min_reserve_b: 0,
-            });
+        let req = Self::read_min_reserve(env, &ta, &tb);
 
         // Requirements are stored under the normalised pair; map them back onto
         // the pool's own token order so `min_a` always describes `token_a`.
@@ -940,7 +948,10 @@ impl ReserveManager {
 mod tests {
     use amm::AmmPool;
     use soroban_sdk::{
-        testutils::{storage::Instance as _, Address as _, Events as _, Ledger as _},
+        testutils::{
+            storage::{Instance as _, Persistent as _},
+            Address as _, Events as _, Ledger as _,
+        },
         token::StellarAssetClient,
         Env, IntoVal, String,
     };
@@ -1586,6 +1597,75 @@ mod tests {
         assert_eq!(data, (new_gov,));
     }
 
+    #[test]
+    fn test_set_min_reserve_emits_versioned_event_and_removal() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+
+        let (larger_token, smaller_token) = if s.ta < s.tb {
+            (&s.tb, &s.ta)
+        } else {
+            (&s.ta, &s.tb)
+        };
+
+        // Pass tokens in reverse lexicographical order to verify the event
+        // carries the normalized pair and swapped minimums with removed = false.
+        rm.set_min_reserve(larger_token, smaller_token, &700_000_i128, &300_000_i128);
+
+        let (version, data): (u32, (Address, Address, i128, i128, bool)) =
+            last_versioned_event(&s, "min_reserve_set");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(version, 1);
+        assert_eq!(
+            data,
+            (
+                smaller_token.clone(),
+                larger_token.clone(),
+                300_000_i128,
+                700_000_i128,
+                false,
+            )
+        );
+
+        // Removing the requirement (both zero) emits removed = true.
+        rm.set_min_reserve(&s.ta, &s.tb, &0_i128, &0_i128);
+
+        let (version_rm, data_rm): (u32, (Address, Address, i128, i128, bool)) =
+            last_versioned_event(&s, "min_reserve_set");
+        assert_eq!(version_rm, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(
+            data_rm,
+            (
+                smaller_token.clone(),
+                larger_token.clone(),
+                0_i128,
+                0_i128,
+                true,
+            )
+        );
+    }
+
+    #[test]
+    fn test_set_pool_kind_emits_versioned_event() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        let cl = deploy_cl_pool(&s, 1_000_000);
+
+        rm.set_pool_kind(&s.pool, &PoolKind::Amm);
+
+        let (version, data): (u32, (Address, PoolKind)) = last_versioned_event(&s, "pool_kind_set");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(version, 1);
+        assert_eq!(data, (s.pool.clone(), PoolKind::Amm));
+
+        rm.set_pool_kind(&cl, &PoolKind::ConcentratedLiquidity);
+
+        let (version_cl, data_cl): (u32, (Address, PoolKind)) =
+            last_versioned_event(&s, "pool_kind_set");
+        assert_eq!(version_cl, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(data_cl, (cl, PoolKind::ConcentratedLiquidity));
+    }
+
     // ── Issue #909: instance storage TTL is never extended ──────────────────
     //
     // `reserve_manager` used to extend only its per-pair persistent
@@ -1716,6 +1796,44 @@ mod tests {
 
         assert_instance_ttl_bumped(&s.env, &s.rm_addr);
         assert!(rm.check_reserves(&s.pool));
+    }
+
+    #[test]
+    fn test_pause_restores_lapsed_instance_ttl() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+
+        lower_instance_ttl_below_threshold(&s.env, &s.rm_addr);
+
+        rm.pause();
+
+        assert_instance_ttl_bumped(&s.env, &s.rm_addr);
+        assert!(rm.is_paused());
+    }
+
+    #[test]
+    fn test_unpause_restores_lapsed_instance_ttl() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        rm.pause();
+
+        lower_instance_ttl_below_threshold(&s.env, &s.rm_addr);
+
+        rm.unpause();
+
+        assert_instance_ttl_bumped(&s.env, &s.rm_addr);
+        assert!(!rm.is_paused());
+    }
+
+    #[test]
+    fn test_is_paused_restores_lapsed_instance_ttl() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+
+        lower_instance_ttl_below_threshold(&s.env, &s.rm_addr);
+
+        assert!(!rm.is_paused());
+        assert_instance_ttl_bumped(&s.env, &s.rm_addr);
     }
 
     #[test]
@@ -2103,5 +2221,69 @@ mod tests {
         assert_eq!(report.min_b, 500_000);
         assert_eq!(report.shortfall_a, 400_000);
         assert_eq!(report.shortfall_b, 400_000);
+    }
+
+    fn floor_ttl(s: &Setup) -> u32 {
+        let (ta, tb) = ReserveManager::normalize(s.ta.clone(), s.tb.clone());
+        s.env.as_contract(&s.rm_addr, || {
+            s.env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::MinReserve(ta, tb))
+        })
+    }
+
+    fn age_floor_below_threshold(s: &Setup) {
+        let remaining = MIN_PERSISTENT_TTL - 1;
+        let advance = floor_ttl(s) - remaining;
+        s.env.ledger().with_mut(|l| l.sequence_number += advance);
+        assert_eq!(floor_ttl(s), remaining);
+    }
+
+    #[test]
+    fn test_get_min_reserve_and_check_reserves_extend_ttl() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+
+        rm.set_min_reserve(&s.ta, &s.tb, &2_000_000_i128, &2_000_000_i128);
+        age_floor_below_threshold(&s);
+        assert!(!rm.check_reserves(&s.pool));
+        assert_eq!(floor_ttl(&s), PERSISTENT_TTL_BUMP_TO);
+        age_floor_below_threshold(&s);
+        let req = rm.get_min_reserve(&s.ta, &s.tb);
+        assert_eq!(floor_ttl(&s), PERSISTENT_TTL_BUMP_TO);
+        assert_eq!(req.min_reserve_a, 2_000_000);
+        assert_eq!(req.min_reserve_b, 2_000_000);
+        assert!(!rm.check_reserves(&s.pool));
+    }
+
+    #[test]
+    fn test_check_reserves_detailed_and_batch_extend_ttl() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+
+        rm.set_min_reserve(&s.ta, &s.tb, &2_000_000_i128, &2_000_000_i128);
+
+        age_floor_below_threshold(&s);
+
+        let detailed = rm.check_reserves_detailed(&s.pool);
+        assert_eq!(floor_ttl(&s), PERSISTENT_TTL_BUMP_TO);
+        assert!(!detailed.healthy);
+        assert_eq!(detailed.min_a, 2_000_000);
+        assert_eq!(detailed.min_b, 2_000_000);
+        assert_eq!(detailed.shortfall_a, 1_000_000);
+        assert_eq!(detailed.shortfall_b, 1_000_000);
+
+        age_floor_below_threshold(&s);
+
+        let pools = soroban_sdk::vec![&s.env, s.pool.clone()];
+        let reports = rm.check_reserves_batch(&pools);
+        assert_eq!(floor_ttl(&s), PERSISTENT_TTL_BUMP_TO);
+        let report = reports.get(0).unwrap();
+        assert!(!report.healthy);
+        assert_eq!(report.min_a, 2_000_000);
+        assert_eq!(report.min_b, 2_000_000);
+        assert_eq!(report.shortfall_a, 1_000_000);
+        assert_eq!(report.shortfall_b, 1_000_000);
     }
 }

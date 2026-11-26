@@ -339,7 +339,88 @@ impl ClPoolState {
         Ok(())
     }
 
-    /// Mirrors the contract's `update_tick` for a liquidity increase.
+    /// Remove `liquidity` from `owner`'s position over `[lower_tick, upper_tick)`.
+    ///
+    /// Mirrors the contract's `burn_position` bookkeeping: settles pending fees
+    /// into `tokens_owed`, decreases position liquidity, updates both boundary
+    /// ticks (deleting any tick whose `liquidity_gross` reaches zero), and
+    /// decreases active liquidity if the range contains the current tick.
+    /// Like the contract, this is allowed even while the pool is paused.
+    pub fn remove_liquidity(
+        &mut self,
+        owner: &str,
+        lower_tick: i32,
+        upper_tick: i32,
+        liquidity: i128,
+    ) -> Result<()> {
+        if liquidity <= 0 {
+            return Err(SimulationError::ZeroAmount);
+        }
+        let key = Self::position_key(owner, lower_tick, upper_tick);
+        let current_liquidity = self
+            .positions
+            .get(&key)
+            .ok_or_else(|| {
+                SimulationError::InvalidInput(format!(
+                    "no position for {owner} over [{lower_tick}, {upper_tick})"
+                ))
+            })?
+            .liquidity;
+        if current_liquidity < liquidity {
+            return Err(SimulationError::InsufficientShares);
+        }
+
+        let (inside_a, inside_b) = self.fee_growth_inside(lower_tick, upper_tick);
+        let position = self.positions.get_mut(&key).unwrap();
+        let (owed_a, owed_b) = pending_fees(position, inside_a, inside_b);
+        position.tokens_owed_a += owed_a;
+        position.tokens_owed_b += owed_b;
+        position.fee_growth_inside_a_snapshot = inside_a;
+        position.fee_growth_inside_b_snapshot = inside_b;
+        position.liquidity -= liquidity;
+
+        self.update_tick(lower_tick, -liquidity, false);
+        self.update_tick(upper_tick, -liquidity, true);
+
+        if self.current_tick >= lower_tick && self.current_tick < upper_tick {
+            self.liquidity = (self.liquidity - liquidity).max(0);
+        }
+        Ok(())
+    }
+
+    /// Settle and collect all accrued fees for `owner`'s position over
+    /// `[lower_tick, upper_tick)`.
+    ///
+    /// Mirrors the contract's `collect_fees`: settles pending fees since the
+    /// last snapshot, advances the position's fee-growth snapshots, zeroes
+    /// `tokens_owed`, and returns `(collected_a, collected_b)`. A subsequent
+    /// call with no intervening swaps returns `(0, 0)`. Allowed while paused.
+    pub fn collect_fees(
+        &mut self,
+        owner: &str,
+        lower_tick: i32,
+        upper_tick: i32,
+    ) -> Result<(i128, i128)> {
+        let key = Self::position_key(owner, lower_tick, upper_tick);
+        if !self.positions.contains_key(&key) {
+            return Err(SimulationError::InvalidInput(format!(
+                "no position for {owner} over [{lower_tick}, {upper_tick})"
+            )));
+        }
+        let (inside_a, inside_b) = self.fee_growth_inside(lower_tick, upper_tick);
+        let position = self.positions.get_mut(&key).unwrap();
+        let (owed_a, owed_b) = pending_fees(position, inside_a, inside_b);
+        let total_a = position.tokens_owed_a + owed_a;
+        let total_b = position.tokens_owed_b + owed_b;
+        position.fee_growth_inside_a_snapshot = inside_a;
+        position.fee_growth_inside_b_snapshot = inside_b;
+        position.tokens_owed_a = 0;
+        position.tokens_owed_b = 0;
+        Ok((total_a, total_b))
+    }
+
+    /// Mirrors the contract's `update_tick` for both liquidity increases and
+    /// decreases, deleting the tick entry when `liquidity_gross` reaches zero.
     fn update_tick(&mut self, tick: i32, liquidity_delta: i128, is_upper: bool) {
         let current_tick = self.current_tick;
         let (fg_a, fg_b) = (self.fee_growth_global_a, self.fee_growth_global_b);
@@ -361,6 +442,9 @@ impl ClPoolState {
             info.liquidity_net -= liquidity_delta;
         } else {
             info.liquidity_net += liquidity_delta;
+        }
+        if info.liquidity_gross == 0 {
+            self.ticks.remove(&tick);
         }
     }
 

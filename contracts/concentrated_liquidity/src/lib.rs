@@ -5,6 +5,11 @@
 pub mod math;
 pub mod tick_bitmap;
 
+#[cfg(test)]
+mod guard_tests;
+#[cfg(test)]
+mod tests_quote_parity;
+
 use soroban_sdk::token::Client as TokenClient;
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, Address,
@@ -76,7 +81,7 @@ pub enum ClError {
     Paused = 11,
     Unauthorized = 12,
     TickNotAligned = 13,     // tick is not a multiple of tick_spacing
-    InvalidTickSpacing = 14, // tick_spacing must be > 0
+    InvalidTickSpacing = 14, // tick_spacing must be in 1..=MAX_TICK
     TickNotInitialized = 15, // requested tick has no liquidity (never touched by a position)
     InvalidToken = 16,       // token_in is not token_a or token_b
     RangeOrderInRange = 17,  // range order must be fully out-of-range at creation
@@ -105,6 +110,9 @@ pub enum ClError {
     /// `set_oracle_cardinality` was called with zero, a value smaller than the
     /// current cardinality, or a value above `MAX_ORACLE_CARDINALITY` (#1101).
     InvalidOracleCardinality = 27,
+    /// `set_position_nft` was given an address that is not a `cl_position_nft`
+    /// contract initialized with this pool's address as its `cl_pool`.
+    NftNotWiredToPool = 28,
 }
 
 /// Status of a range order (issue #295).
@@ -219,6 +227,7 @@ pub trait PositionNftInterface {
     fn mint(env: Env, to: Address, pool: Address, lower_tick: i32, upper_tick: i32) -> u64;
     fn burn(env: Env, token_id: u64);
     fn owner_of(env: Env, token_id: u64) -> Address;
+    fn cl_pool(env: Env) -> Address;
 }
 
 #[contracttype]
@@ -346,8 +355,8 @@ impl ConcentratedLiquidity {
 
     /// One-time initialisation. Sets admin, token pair, fee, starting tick, and tick spacing.
     ///
-    /// `tick_spacing` must be > 0. Only tick values that are exact multiples of
-    /// `tick_spacing` may be used as position boundaries in `mint_position`.
+    /// `tick_spacing` must be in `1..=MAX_TICK`. Only tick values that are exact
+    /// multiples of `tick_spacing` may be used as position boundaries in `mint_position`.
     /// Suggested defaults: fee 5 bps → spacing 1, fee 30 bps → spacing 10,
     /// fee 100 bps → spacing 60.
     pub fn initialize(
@@ -372,7 +381,7 @@ impl ConcentratedLiquidity {
         if !(MIN_TICK..=MAX_TICK).contains(&initial_tick) {
             return Err(ClError::TickOutOfRange);
         }
-        if tick_spacing <= 0 {
+        if !(1..=MAX_TICK).contains(&tick_spacing) {
             return Err(ClError::InvalidTickSpacing);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -420,6 +429,11 @@ impl ConcentratedLiquidity {
             .persistent()
             .set(&DataKey::TickBitmapWords, &Vec::<i32>::new(&env));
         Self::bump_position(&env, &DataKey::TickBitmapWords);
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "initialized"),),
+            (admin, token_a, token_b, fee_bps, initial_tick, tick_spacing)
+        );
         Ok(())
     }
 
@@ -480,6 +494,17 @@ impl ConcentratedLiquidity {
         // Changing from Some(A) → Some(B) is forbidden.
         if existing_nft.is_some() && nft.is_some() && existing_nft != nft {
             return Err(ClError::NftContractChangeBlocked);
+        }
+
+        // Verify the candidate NFT contract is initialized and wired to this pool.
+        if let Some(ref nft_addr) = nft {
+            let wired_pool = match PositionNftClient::new(&env, nft_addr).try_cl_pool() {
+                Ok(Ok(pool)) => pool,
+                _ => return Err(ClError::NftNotWiredToPool),
+            };
+            if wired_pool != env.current_contract_address() {
+                return Err(ClError::NftNotWiredToPool);
+            }
         }
 
         env.storage().instance().set(&DataKey::PositionNft, &nft);
@@ -1246,91 +1271,13 @@ impl ConcentratedLiquidity {
         //    Dust = amount_in - amount_used (never transferred; stays with provider).
         //
 
-        let (amount_a, amount_b, liquidity, amount_used) = if current_tick < lower_tick {
-            // Case 1: price below range — only token A
-            if !is_token_a {
-                return Err(ClError::SlippageExceeded);
-            }
-            // Use proper sqrtPriceX96 formulas for accurate calculation
-            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
-            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
-            let liq = math::get_liquidity_for_amount0(sqrt_lower, sqrt_upper, amount_in)
-                .ok_or(ClError::MathOverflow)?;
-            (amount_in, 0_i128, liq.max(1), amount_in)
-        } else if current_tick >= upper_tick {
-            // Case 2: price above range — only token B
-            if is_token_a {
-                return Err(ClError::SlippageExceeded);
-            }
-            // Use proper sqrtPriceX96 formulas for accurate calculation
-            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
-            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
-            let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_upper, amount_in)
-                .ok_or(ClError::MathOverflow)?;
-            (0_i128, amount_in, liq.max(1), amount_in)
-        } else {
-            // Case 3: price in range — compute liquidity from the single token's half
-            // Using proper Uniswap V3 formulas with sqrtPriceX96
-            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
-            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
-            let sqrt_current = Self::tick_to_sqrt_price_x96(current_tick);
-
-            if sqrt_current >= sqrt_upper {
-                // Degenerate: current at or above upper tick
-                if is_token_a {
-                    let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in)
-                        .ok_or(ClError::MathOverflow)?;
-                    let liq = liq.max(1);
-                    let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq)
-                        .ok_or(ClError::MathOverflow)?;
-                    (used, 0_i128, liq, used)
-                } else {
-                    let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in)
-                        .ok_or(ClError::MathOverflow)?;
-                    let liq = liq.max(1);
-                    let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq)
-                        .ok_or(ClError::MathOverflow)?;
-                    (0_i128, used, liq, used)
-                }
-            } else if sqrt_current <= sqrt_lower {
-                // Degenerate: current at or below lower tick
-                if is_token_a {
-                    let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in)
-                        .ok_or(ClError::MathOverflow)?;
-                    let liq = liq.max(1);
-                    let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq)
-                        .ok_or(ClError::MathOverflow)?;
-                    (used, 0_i128, liq, used)
-                } else {
-                    let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in)
-                        .ok_or(ClError::MathOverflow)?;
-                    let liq = liq.max(1);
-                    let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq)
-                        .ok_or(ClError::MathOverflow)?;
-                    (0_i128, used, liq, used)
-                }
-            } else if is_token_a {
-                // Token A covers [current_price, upper_price].
-                // Liquidity is computed from the amount, then we back-compute actual token amount.
-                let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in)
-                    .ok_or(ClError::MathOverflow)?;
-                let liq = liq.max(1);
-                let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq)
-                    .ok_or(ClError::MathOverflow)?;
-                (used, 0_i128, liq, used)
-            } else {
-                // Token B covers [lower_price, current_price].
-                let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in)
-                    .ok_or(ClError::MathOverflow)?;
-                let liq = liq.max(1);
-                let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq)
-                    .ok_or(ClError::MathOverflow)?;
-                (0_i128, used, liq, used)
-            }
-        };
-        if liquidity <= 0 {
-            return Err(ClError::ZeroLiquidity);
-        }
+        let (amount_a, amount_b, liquidity, amount_used) = Self::compute_single_token_deposit(
+            current_tick,
+            lower_tick,
+            upper_tick,
+            is_token_a,
+            amount_in,
+        )?;
         if liquidity < min_liquidity {
             return Err(ClError::SlippageExceeded);
         }
@@ -1437,6 +1384,67 @@ impl ConcentratedLiquidity {
         })
     }
 
+    /// Shared amount/liquidity calculation for `mint_position_single_token` and
+    /// `quote_single_token_deposit`.
+    ///
+    /// Returns `(amount_a, amount_b, liquidity, amount_used)`.
+    fn compute_single_token_deposit(
+        current_tick: i32,
+        lower_tick: i32,
+        upper_tick: i32,
+        is_token_a: bool,
+        amount_in: i128,
+    ) -> Result<(i128, i128, i128, i128), ClError> {
+        let (amount_a, amount_b, liquidity, amount_used) = if current_tick < lower_tick {
+            // Case 1: price below range — only token A
+            if !is_token_a {
+                return Err(ClError::SlippageExceeded);
+            }
+            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
+            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
+            let liq = math::get_liquidity_for_amount0(sqrt_lower, sqrt_upper, amount_in)
+                .ok_or(ClError::MathOverflow)?;
+            (amount_in, 0_i128, liq.max(1), amount_in)
+        } else if current_tick >= upper_tick {
+            // Case 2: price above range — only token B
+            if is_token_a {
+                return Err(ClError::SlippageExceeded);
+            }
+            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
+            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
+            let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_upper, amount_in)
+                .ok_or(ClError::MathOverflow)?;
+            (0_i128, amount_in, liq.max(1), amount_in)
+        } else {
+            // Case 3: price in range — compute liquidity from the single token's half
+            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
+            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
+            let sqrt_current = Self::tick_to_sqrt_price_x96(current_tick);
+
+            if is_token_a {
+                let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in)
+                    .ok_or(ClError::MathOverflow)?;
+                let liq = liq.max(1);
+                let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq)
+                    .ok_or(ClError::MathOverflow)?;
+                (used, 0_i128, liq, used)
+            } else {
+                let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in)
+                    .ok_or(ClError::MathOverflow)?;
+                let liq = liq.max(1);
+                let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq)
+                    .ok_or(ClError::MathOverflow)?;
+                (0_i128, used, liq, used)
+            }
+        };
+
+        if liquidity <= 0 || (amount_a <= 0 && amount_b <= 0) {
+            return Err(ClError::ZeroLiquidity);
+        }
+
+        Ok((amount_a, amount_b, liquidity, amount_used))
+    }
+
     /// Quote the expected result of a single-token deposit without executing it.
     ///
     /// Pure read — does not transfer tokens or modify state.
@@ -1456,6 +1464,14 @@ impl ConcentratedLiquidity {
         if lower_tick < MIN_TICK || upper_tick > MAX_TICK {
             return Err(ClError::TickOutOfRange);
         }
+        let tick_spacing: i32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TickSpacing)
+            .unwrap_or(1);
+        if lower_tick % tick_spacing != 0 || upper_tick % tick_spacing != 0 {
+            return Err(ClError::TickNotAligned);
+        }
         if amount_in <= 0 {
             return Err(ClError::ZeroAmounts);
         }
@@ -1467,55 +1483,13 @@ impl ConcentratedLiquidity {
         }
 
         let current_tick = Self::read_current_tick(&env)?;
-
-        // Mirror the exact same logic as mint_position_single_token.
-        let (liquidity, amount_used) = if current_tick < lower_tick {
-            if !is_token_a {
-                return Err(ClError::SlippageExceeded);
-            }
-            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
-            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
-            let liq = math::get_liquidity_for_amount0(sqrt_lower, sqrt_upper, amount_in)
-                .ok_or(ClError::MathOverflow)?;
-            (liq.max(1), amount_in)
-        } else if current_tick >= upper_tick {
-            if is_token_a {
-                return Err(ClError::SlippageExceeded);
-            }
-            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
-            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
-            let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_upper, amount_in)
-                .ok_or(ClError::MathOverflow)?;
-            (liq.max(1), amount_in)
-        } else {
-            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
-            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
-            let sqrt_current = Self::tick_to_sqrt_price_x96(current_tick);
-
-            if sqrt_current >= sqrt_upper {
-                let liq = math::get_liquidity_for_amount0(sqrt_upper, sqrt_upper, amount_in)
-                    .ok_or(ClError::MathOverflow)?;
-                (liq.max(1), amount_in)
-            } else if sqrt_current <= sqrt_lower {
-                let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_lower, amount_in)
-                    .ok_or(ClError::MathOverflow)?;
-                (liq.max(1), amount_in)
-            } else if is_token_a {
-                let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in)
-                    .ok_or(ClError::MathOverflow)?;
-                let liq = liq.max(1);
-                let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq)
-                    .ok_or(ClError::MathOverflow)?;
-                (liq, used)
-            } else {
-                let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in)
-                    .ok_or(ClError::MathOverflow)?;
-                let liq = liq.max(1);
-                let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq)
-                    .ok_or(ClError::MathOverflow)?;
-                (liq, used)
-            }
-        };
+        let (_amount_a, _amount_b, liquidity, amount_used) = Self::compute_single_token_deposit(
+            current_tick,
+            lower_tick,
+            upper_tick,
+            is_token_a,
+            amount_in,
+        )?;
 
         Ok(SingleTokenDepositResult {
             amount_used,
@@ -2452,6 +2426,13 @@ impl ConcentratedLiquidity {
                 zero_for_one,
             );
 
+            // A saturated tick can map to the exact current sqrt price. There
+            // is then no trade to execute and crossing it again cannot advance
+            // the walk; leave the remaining amount untouched (issue #1305).
+            if target_price_x96 == sqrt_price_x96 {
+                break;
+            }
+
             let amount_in_after_fee = amount_remaining * (10000 - fee_bps) / 10000;
 
             let (amount_in_step_after_fee, amount_out_step) = if active_liquidity == 0 {
@@ -2940,6 +2921,13 @@ impl ConcentratedLiquidity {
                 sqrt_price_limit_x96,
                 zero_for_one,
             );
+
+            // A saturated tick can map to the exact current sqrt price. There
+            // is then no trade to execute and crossing it again cannot advance
+            // the walk; leave the remaining amount untouched (issue #1305).
+            if target_price_x96 == sqrt_price_x96 {
+                break;
+            }
 
             let (amount_in_step_after_fee, amount_out_step) = if active_liquidity == 0 {
                 (0, 0)
@@ -3548,7 +3536,8 @@ impl ConcentratedLiquidity {
             return Err(ClError::InvalidOracleCardinality);
         }
 
-        if new_cardinality > header.cardinality {
+        let old_cardinality = header.cardinality;
+        if new_cardinality > old_cardinality {
             // If the ring buffer had wrapped around under the old cardinality,
             // normalize the existing `count` observations into contiguous slots
             // `0..count` in chronological order so the invariant (`count < cardinality`
@@ -3584,6 +3573,11 @@ impl ConcentratedLiquidity {
                 .set(&DataKey::OracleHeader, &header);
         }
 
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "oracle_cardinality_set"),),
+            (old_cardinality, new_cardinality)
+        );
         Ok(())
     }
 
@@ -3931,6 +3925,15 @@ impl ConcentratedLiquidity {
         }
         if lower_tick < MIN_TICK || upper_tick > MAX_TICK {
             return Err(ClError::TickOutOfRange);
+        }
+        // Enforce tick spacing: ticks must be multiples of tick_spacing.
+        let tick_spacing: i32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TickSpacing)
+            .unwrap_or(1);
+        if lower_tick % tick_spacing != 0 || upper_tick % tick_spacing != 0 {
+            return Err(ClError::TickNotAligned);
         }
         if liquidity <= 0 {
             return Err(ClError::ZeroLiquidity);
@@ -4496,6 +4499,13 @@ impl ConcentratedLiquidity {
                 sqrt_price_limit_x96,
                 zero_for_one,
             );
+
+            // A saturated tick can map to the exact current sqrt price. There
+            // is then no trade to execute and crossing it again cannot advance
+            // the walk; leave the remaining amount untouched (issue #1305).
+            if target_price_x96 == sqrt_price_x96 {
+                break;
+            }
 
             let amount_in_after_fee = amount_remaining * (10000 - fee_bps) / 10000;
 
@@ -6816,6 +6826,74 @@ mod test_tick_spacing {
         assert_eq!(result, Err(Ok(ClError::InvalidTickSpacing)));
     }
 
+    /// A spacing above the tick domain cannot produce a valid position range.
+    #[test]
+    fn test_tick_spacing_above_max_tick_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        env.budget().reset_unlimited();
+        let token_a = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let token_b = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+
+        let result = client.try_initialize(
+            &admin,
+            &token_a,
+            &token_b,
+            &30_i128,
+            &0_i32,
+            &(MAX_TICK + 1),
+        );
+        assert_eq!(result, Err(Ok(ClError::InvalidTickSpacing)));
+    }
+
+    /// The largest i32 spacing must also be rejected without overflow.
+    #[test]
+    fn test_i32_max_tick_spacing_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        env.budget().reset_unlimited();
+        let token_a = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let token_b = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+
+        let result = client.try_initialize(
+            &admin,
+            &token_a,
+            &token_b,
+            &30_i128,
+            &0_i32,
+            &i32::MAX,
+        );
+        assert_eq!(result, Err(Ok(ClError::InvalidTickSpacing)));
+    }
+
+    /// MAX_TICK is a valid spacing and its two boundary ticks can be minted.
+    #[test]
+    fn test_max_tick_spacing_allows_mint() {
+        let env = Env::default();
+        let (provider, _ta, _tb, client) = setup_cl(&env, MAX_TICK);
+
+        let result = client.try_mint_position(
+            &provider,
+            &-MAX_TICK,
+            &MAX_TICK,
+            &100_000_i128,
+            &100_000_i128,
+            &0_i128,
+            &0_i128,
+            &u64::MAX,
+        );
+        assert!(
+            result.is_ok(),
+            "MAX_TICK spacing must permit the full-domain range"
+        );
+    }
+
     /// get_pool_state must include tick_spacing set at initialize time.
     #[test]
     fn test_get_pool_state_returns_tick_spacing() {
@@ -6827,6 +6905,40 @@ mod test_tick_spacing {
             state.tick_spacing, 60,
             "get_pool_state must return tick_spacing = 60"
         );
+    }
+
+    /// quote_position must reject a misaligned lower tick with TickNotAligned.
+    #[test]
+    fn test_quote_position_misaligned_lower_tick_rejected() {
+        let env = Env::default();
+        let (_provider, _ta, _tb, client) = setup_cl(&env, 10);
+
+        let result = client.try_quote_position(&-7_i32, &10_i32, &10_000_i128);
+        assert_eq!(result, Err(Ok(ClError::TickNotAligned)));
+    }
+
+    /// quote_position must reject a misaligned upper tick with TickNotAligned.
+    #[test]
+    fn test_quote_position_misaligned_upper_tick_rejected() {
+        let env = Env::default();
+        let (_provider, _ta, _tb, client) = setup_cl(&env, 10);
+
+        let result = client.try_quote_position(&-10_i32, &7_i32, &10_000_i128);
+        assert_eq!(result, Err(Ok(ClError::TickNotAligned)));
+    }
+
+    /// quote_position with aligned ticks on a spacing-10 pool must succeed and return
+    /// the exact same amounts as on a spacing-1 pool.
+    #[test]
+    fn test_quote_position_aligned_ticks_unchanged() {
+        let env = Env::default();
+        let (_provider1, _ta1, _tb1, client_spacing_1) = setup_cl(&env, 1);
+        let (_provider10, _ta10, _tb10, client_spacing_10) = setup_cl(&env, 10);
+
+        let expected = client_spacing_1.quote_position(&-100_i32, &100_i32, &10_000_i128);
+        let actual = client_spacing_10.quote_position(&-100_i32, &100_i32, &10_000_i128);
+        assert_eq!(actual, expected);
+        assert!(actual.0 > 0 && actual.1 > 0);
     }
 
     /// tick_spacing = 1 allows every tick (no restriction).
@@ -8486,6 +8598,131 @@ mod test_single_token_deposit {
             f.client.position_of_token(&0_u64),
             Some((f.alice.clone(), f.lower, f.upper))
         );
+    }
+
+    #[test]
+    fn set_position_nft_rejects_uninitialized_nft() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &1_i32);
+
+        let uninit_nft = env.register_contract(None, ClPositionNft);
+        assert_eq!(
+            client.try_set_position_nft(&admin, &Some(uninit_nft)),
+            Err(Ok(ClError::NftNotWiredToPool))
+        );
+        assert_eq!(client.position_nft(), None);
+    }
+
+    #[test]
+    fn set_position_nft_rejects_nft_wired_to_other_pool() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &1_i32);
+
+        let other_pool = Address::generate(&env);
+        let nft_addr = env.register_contract(None, ClPositionNft);
+        let nft = ClPositionNftClient::new(&env, &nft_addr);
+        nft.initialize(&admin, &other_pool);
+
+        assert_eq!(
+            client.try_set_position_nft(&admin, &Some(nft_addr)),
+            Err(Ok(ClError::NftNotWiredToPool))
+        );
+        assert_eq!(client.position_nft(), None);
+    }
+
+    #[test]
+    fn set_position_nft_rejects_non_contract_address() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &1_i32);
+
+        let non_contract = Address::generate(&env);
+        assert_eq!(
+            client.try_set_position_nft(&admin, &Some(non_contract)),
+            Err(Ok(ClError::NftNotWiredToPool))
+        );
+        assert_eq!(client.position_nft(), None);
+    }
+
+    #[test]
+    fn set_position_nft_accepts_wired_nft_and_mints_token() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &1_i32);
+
+        let nft_addr = env.register_contract(None, ClPositionNft);
+        let nft = ClPositionNftClient::new(&env, &nft_addr);
+        nft.initialize(&admin, &cl_addr);
+
+        client.set_position_nft(&admin, &Some(nft_addr.clone()));
+        assert_eq!(client.position_nft(), Some(nft_addr));
+
+        StellarAssetClient::new(&env, &token_a).mint(&alice, &1_000_000_i128);
+        StellarAssetClient::new(&env, &token_b).mint(&alice, &1_000_000_i128);
+        client.mint_position(
+            &alice,
+            &-100_i32,
+            &100_i32,
+            &100_000_i128,
+            &100_000_i128,
+            &0_i128,
+            &0_i128,
+            &u64::MAX,
+        );
+
+        assert_eq!(nft.owner_of(&0_u64), alice);
+        assert_eq!(client.position_token_id(&alice, &-100_i32, &100_i32), Some(0_u64));
     }
 
     #[test]
@@ -11163,6 +11400,9 @@ mod test_range_order_fill_status {
         assert!((2990..=3010).contains(&collected_a));
     }
 }
+
+#[cfg(test)]
+mod tests_boundary_progress;
 
 #[cfg(test)]
 mod tests_issue_1100;
